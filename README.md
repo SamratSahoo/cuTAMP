@@ -82,6 +82,10 @@ pip install -e .
 
 ### 4. Install cuRobo
 
+> ⚠️ **Pin cuRobo to `v0.7.8`.** cuRobo `v0.8.0` is effectively a new major version
+> with API changes that are incompatible with cuTAMP, so we pin to the last compatible
+> release.
+
 Before cloning cuRobo, make sure `git-lfs` is installed (used for pulling large assets).
 
 ```bash
@@ -89,11 +93,12 @@ sudo apt install git-lfs
 git lfs install
 ```
 
-Then clone and install cuRobo:
+Then clone cuRobo, check out the pinned `v0.7.8` tag, and install:
 
 ```bash
 git clone https://github.com/NVlabs/curobo.git
 cd curobo
+git checkout v0.7.8
 
 # This can take up to 20 minutes to install
 pip install -e . --no-build-isolation
