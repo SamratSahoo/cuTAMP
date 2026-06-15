@@ -62,6 +62,7 @@ def get_fr3_robotiq_ik_solver(
         self_collision_opt=self_collision_opt,
         self_collision_check=self_collision_check,
         use_particle_opt=use_particle_opt,
+        use_cuda_graph=False,  # della: CUDA-graph replay throws illegal memory access on driver 595
     )
     ik_solver = IKSolver(ik_config)
     return ik_solver
@@ -134,6 +135,7 @@ def get_panda_robotiq_ik_solver(
         self_collision_opt=self_collision_opt,
         self_collision_check=self_collision_check,
         use_particle_opt=use_particle_opt,
+        use_cuda_graph=False,  # della: CUDA-graph replay throws illegal memory access on driver 595
     )
     return IKSolver(ik_config)
 
