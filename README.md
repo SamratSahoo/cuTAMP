@@ -1,5 +1,7 @@
 # cuTAMP: Differentiable GPU-Parallelized Task and Motion Planning
 
+> **Note:** This is a fork of the original [cuTAMP](https://github.com/NVlabs/cuTAMP) with modifications to support [TiPToP](https://tiptop-robot.github.io). See [CHANGELOG.md](CHANGELOG.md) for version history.
+
 ### [🌐 Project Website](https://cutamp.github.io) | [📝 Paper](https://arxiv.org/abs/2411.11833)
 
 > **Differentiable GPU-Parallelized Task and Motion Planning**  
@@ -159,6 +161,15 @@ If you're running cuTAMP on a remote server without a display, you have two opti
     cutamp-demo
     ```
    The visualizer will connect and stream to your local Rerun viewer through the tunnel!
+
+## Testing
+
+Install dev dependencies and run the test suite with pytest. Some tests require a GPU.
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v
+```
 
 ## Examples
 

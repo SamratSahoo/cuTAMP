@@ -11,19 +11,23 @@
 
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import List, Union, Optional, Tuple
 from unittest.mock import Mock
 
 import torch
-from curobo.types.base import TensorDeviceType
 
+from curobo.types.base import TensorDeviceType
+from curobo.types.math import Pose
+from curobo.wrap.reacher.ik_solver import IKSolver
+from curobo.wrap.reacher.motion_gen import MotionGen
 from cutamp.config import TAMPConfiguration, validate_tamp_config
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
 from cutamp.envs.utils import TAMPEnvironment
 from cutamp.experiment_logger import ExperimentLogger
-from cutamp.motion_solver import solve_curobo
+from cutamp.motion_solver import solve_curobo, MotionPlanningError
 from cutamp.optimize_plan import ParticleOptimizer
 from cutamp.particle_initialization import ParticleInitializer
 from cutamp.robots import get_q_home, load_robot_container
@@ -31,8 +35,9 @@ from cutamp.rollout import RolloutFunction
 from cutamp.tamp_domain import all_tamp_operators
 from cutamp.tamp_world import TAMPWorld, check_tamp_world_not_in_collision
 from cutamp.task_planning import PlanSkeleton, task_plan_generator
+from cutamp.utils.common import get_world_cfg
 from cutamp.utils.timer import TorchTimer
-from cutamp.utils.visualizer import RerunVisualizer, MockVisualizer
+from cutamp.utils.visualizer import RerunVisualizer, MockVisualizer, Visualizer
 
 _log = logging.getLogger(__name__)
 
@@ -96,8 +101,98 @@ def get_best_particle(
     best_satisfying_idx = satisfying_costs.argmin()
     indices = torch.arange(config.num_particles, device=satisfying_costs.device)
     best_idx = indices[satisfying_mask][best_satisfying_idx]
-    best_particle = {k: v[best_idx].detach().clone() for k, v in particles.items()}
+    best_particle = {k: v[best_idx].detach().clone() for k, v in particles.items() if v is not None}
     return best_particle
+
+
+def _visualize_best_particle(
+    visualizer: Visualizer,
+    rollout: dict,
+    best_idx: int,
+    world: TAMPWorld,
+    config: TAMPConfiguration,
+) -> None:
+    """Visualize the rollout for the best ranked particle."""
+    visualizer.set_time_sequence("rollout_best", 0)
+    visualizer.set_joint_positions(world.q_init.tolist())
+    for obj in world.movables:
+        obj_pose = world.get_object_pose(obj).cpu()
+        visualizer.log_mat4x4(f"world/{obj.name}", obj_pose)
+
+    for ts in range(len(rollout["conf_params"])):
+        visualizer.set_time_sequence("rollout_best", ts + 1)
+        q = rollout["confs"][best_idx, ts]
+
+        gripper_close = rollout["gripper_close"][ts]
+        if config.robot == "ur5":
+            gripper_joints = [0.4] if gripper_close else [0.0]
+        elif config.robot == "panda":
+            gripper_joints = [0.01, 0.01] if gripper_close else [0.04, 0.04]
+        else:
+            gripper_joints = []
+        visualizer.set_joint_positions(q.tolist() + gripper_joints)
+
+        ee_pose = Pose(
+            position=rollout["ee_position"][best_idx, ts][None],
+            quaternion=rollout["ee_quaternion"][best_idx, ts][None],
+        )
+        visualizer.log_mat4x4("rollout/ee_pose", ee_pose.get_matrix()[0].cpu())
+
+        robot_spheres = rollout["robot_spheres"][best_idx, ts].cpu()
+        visualizer.log_spheres("rollout/robot_spheres", robot_spheres)
+
+        pose_ts = rollout["ts_to_pose_ts"][ts]
+        for obj in world.movables:
+            obj_pose = rollout["obj_to_pose"][obj.name][best_idx, pose_ts].cpu()
+            visualizer.log_mat4x4(f"world/{obj.name}", obj_pose)
+
+
+def get_ranked_satisfying_particles(
+    plan_info: dict,
+    config: TAMPConfiguration,
+    constraint_checker: ConstraintChecker,
+    cost_reducer: CostReducer,
+    visualizer: Visualizer | None = None,
+) -> dict[str, torch.Tensor]:
+    """Get the satisfying particles ranked by grasp confidence (if available) or soft costs."""
+    particles, rollout_fn, cost_fn = plan_info["particles"], plan_info["rollout_fn"], plan_info["cost_fn"]
+    with torch.no_grad():
+        rollout = rollout_fn(particles)
+        cost_dict = cost_fn(rollout)
+
+    # Get all satisfying particles
+    satisfying_mask = constraint_checker.get_mask(cost_dict, verbose=False)
+    if not satisfying_mask.any():
+        raise RuntimeError("No satisfying particles found")
+
+    soft_costs = cost_reducer.soft_costs(cost_dict)
+    satisfying_costs = soft_costs[satisfying_mask]
+
+    # Sum grasp confidences across all grasp parameters
+    grasp_keys = [k for k in particles if k.startswith("grasp") and k.endswith("_confidences")]
+    grasp_confs = None
+    for grasp_key in grasp_keys:
+        if (conf := particles[grasp_key]) is not None:
+            grasp_confs = conf if grasp_confs is None else (grasp_confs + conf)
+    satisfying_grasp_confs = grasp_confs[satisfying_mask] if grasp_confs is not None else None
+
+    # Rank satisfying particles by grasp confidence (if available) or soft costs
+    indices = torch.arange(config.num_particles, device=satisfying_costs.device)
+    satisfying_idxs = indices[satisfying_mask]
+    use_grasp_ranking = satisfying_grasp_confs is not None
+    if use_grasp_ranking:
+        sorted_idxs = satisfying_grasp_confs.argsort(descending=True)  # Higher confidence is better
+    else:
+        sorted_idxs = satisfying_costs.argsort()  # Lower cost is better
+    ranked_idxs = satisfying_idxs[sorted_idxs]
+    ranked_particles = {k: v[ranked_idxs].detach().clone() for k, v in particles.items() if v is not None}
+
+    # Visualize the best particle
+    if visualizer is not None:
+        best_idx = ranked_idxs[0]
+        _visualize_best_particle(visualizer, rollout, best_idx, rollout_fn.world, config)
+
+    return ranked_particles
 
 
 def sample_plan_skeleton(
@@ -114,7 +209,11 @@ def sample_plan_skeleton(
     Try sampling a plan skeleton (if any remain), then its particles and compute the heuristic.
     Returns the plan_info dict and whether any satisfying particles were found upon initialization.
     """
-    plan_skeleton = next(plan_gen)
+    with timer.time("sample_task_plan"):
+        plan_skeleton = next(plan_gen)
+    if not plan_skeleton:
+        return None, False
+
     plan_str = [op.name for op in plan_skeleton]
     _log.debug(f"[Plan {plan_count + 1}] Sampled plan {plan_str}")
 
@@ -237,13 +336,19 @@ def setup_cutamp(
     config: TAMPConfiguration,
     q_init: Optional[List[float]] = None,
     experiment_id: Optional[str] = None,
+    ik_solver: Optional[IKSolver] = None,
+    experiment_dir: Optional[Path] = None,
 ):
     # Validate args and setup experiment logger
     validate_tamp_config(config)
     if experiment_id is None:
         experiment_id = datetime.now().isoformat().split(".")[0]
 
-    exp_logger = ExperimentLogger(name=experiment_id, config=config) if config.enable_experiment_logging else Mock()
+    exp_logger = (
+        ExperimentLogger(name=experiment_id, config=config, experiment_dir=experiment_dir)
+        if config.enable_experiment_logging
+        else Mock()
+    )
     exp_logger.save_env(env)
 
     # Loading robot can be done offline, so doesn't count towards timing
@@ -264,8 +369,9 @@ def setup_cutamp(
             collision_activation_distance=config.world_activation_distance,
             coll_n_spheres=config.coll_n_spheres,
             coll_sphere_radius=config.coll_sphere_radius,
+            ik_solver=ik_solver,
         )
-        check_tamp_world_not_in_collision(world)
+        check_tamp_world_not_in_collision(world, movable_activation_dist=config.movable_activation_distance)
 
     if config.warmup_ik:
         with timer.time("warmup_ik_solver", log_callback=_log.info):
@@ -288,11 +394,18 @@ def run_cutamp(
     constraint_checker: ConstraintChecker,
     q_init: Optional[List[float]] = None,
     experiment_id: Optional[str] = None,
+    ik_solver: Optional[IKSolver] = None,
+    grasps: Optional[dict] = None,
+    motion_gen: Optional[MotionGen] = None,
+    experiment_dir: Optional[Path] = None,
 ):
     """Overall cuTAMP algorithm implementation."""
+    if config.m2t2_grasps and not grasps:
+        _log.warning(f"M2T2 grasps enabled but no grasps provided! Falling back to grasp_dof={config.grasp_dof}")
+
     # Setup all the things and load the world
-    exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id)
-    particle_initializer = ParticleInitializer(world, config)
+    exp_logger, visualizer, timer, world = setup_cutamp(env, config, q_init, experiment_id, ik_solver, experiment_dir)
+    particle_initializer = ParticleInitializer(world, config, grasps)
 
     # Task plan generator
     _log.info(f"Initial State: {world.initial_state}")
@@ -336,6 +449,9 @@ def run_cutamp(
 
     sort_plans()
     _log.info(f"Num plans: {len(plan_queue)}, num skipped: {num_skipped_plans}")
+
+    curobo_plan = None
+    failure_reason = None
     overall_metrics = {
         "num_optimized_plans": 0,
         "num_initial_plans": plan_count,
@@ -345,7 +461,6 @@ def run_cutamp(
         "best_cost": float("inf"),
         "best_soft_cost": float("inf"),
     }
-    curobo_plan = None
     found_solution = False
     particle_optimizer = ParticleOptimizer(config, cost_reducer, constraint_checker)
     timer.start("first_solution")
@@ -359,14 +474,22 @@ def run_cutamp(
         opt_iter = idx + 1
         should_break = False
         plan_skeleton = plan_info["plan_skeleton"]
+        _log.info(f"[Opt {opt_iter}] Optimizing plan {[op.name for op in plan_skeleton]}")
         _log.info(
-            f"[Opt {opt_iter}] Optimizing plan {[op.name for op in plan_skeleton]}, plan idx = {plan_info['idx']}, "
-            f"heuristic = {plan_info['heuristic']:.2f}"
+            f"[Opt {opt_iter}] plan idx = {plan_info['idx']}, heuristic = {plan_info['heuristic']:.2f}, "
+            f"num satisfying = {plan_info['num_satisfying']}"
         )
         best_particle = None
 
         if config.approach == "optimization":
             has_satisfying, metrics, time_exceeded = particle_optimizer(plan_info, timer, visualizer)
+
+            # For the sake of printing out debug info
+            with torch.no_grad():
+                rollout = plan_info["rollout_fn"](plan_info["particles"])
+                cost_dict = plan_info["cost_fn"](rollout)
+                _ = heuristic_fn(plan_skeleton, cost_dict, constraint_checker, verbose=True)
+
             if metrics["best_cost"] is not None:
                 overall_metrics["best_cost"] = min(overall_metrics["best_cost"], metrics["best_cost"])
             if metrics["best_soft_cost"] is not None:
@@ -489,19 +612,61 @@ def run_cutamp(
         overall_metrics["num_optimized_plans"] += 1
         if has_satisfying:
             found_solution = True
+            ranked_particles = get_ranked_satisfying_particles(
+                plan_info, config, constraint_checker, cost_reducer, visualizer
+            )
             if config.curobo_plan:
-                curobo_plan = solve_curobo(
-                    plan_info,
-                    best_particle,
-                    world,
-                    config,
-                    timer,
-                    visualizer,
-                )
+                # Need to cache initial pose as cuRobo dynamically updates during planning which sucks ass
+                obj_to_initial_pose = {obj.name: world.get_object_pose(obj) for obj in world.movables}
+
+                # IMPORTANT: this line comes after the previous as it messes with cuRobo internal memory,
+                # also call it only once!
+                if motion_gen is not None:
+                    all_world_cfg = get_world_cfg(world.env, include_movables=True)
+                    motion_gen.update_world(all_world_cfg)
+                    _log.info(f"Updated motion gen with world cfg")
+
+                num_satisfying = ranked_particles["q0"].shape[0]
+                max_attempts = min(config.max_motion_refine_attempts or num_satisfying, num_satisfying)
+                for curr_idx in range(max_attempts):
+                    _log.info(f"Trying cuRobo planning with satisfying particle {curr_idx + 1}/{max_attempts} ({num_satisfying} total satisfying)")
+                    curr_particle = {k: v[curr_idx] for k, v in ranked_particles.items()}
+                    try:
+                        curobo_plan = solve_curobo(
+                            plan_info,
+                            curr_particle,
+                            world,
+                            config,
+                            timer,
+                            visualizer,
+                            obj_to_initial_pose=obj_to_initial_pose,
+                            timeline=f"curobo_{curr_idx}",
+                            motion_gen=motion_gen,
+                        )
+                        _log.info("Successful plan found!")
+                        failure_reason = None
+                        break
+                    except MotionPlanningError as e:
+                        _log.warning(f"Failed to motion plan: {e}")
+                else:
+                    # All attempted particles failed motion planning
+                    if curobo_plan is None:
+                        max_reached = " (max attempts reached)" if max_attempts < num_satisfying else ""
+                        failure_reason = (
+                            f"Motion planning failed for {max_attempts}/{num_satisfying} satisfying particle(s){max_reached}"
+                        )
+
             overall_metrics["num_satisfying_final"] = metrics["num_satisfying_final"]
             overall_metrics["final_plan_skeleton"] = [str(op) for op in plan_skeleton]
             _log.debug(f"Total num satisfying {metrics['num_satisfying_final']}")
-            if config.break_on_satisfying:
+            if config.curobo_plan and curobo_plan is None:
+                # Motion refinement failed, try next skeleton. Intentionally overrides should_break
+                # set by break_on_satisfying during resampling — we don't want to stop on a skeleton
+                # where motion planning failed. The max_loop_dur timeout will still be checked at the
+                # start of the next skeleton's resampling loop.
+                _log.info(f"Motion refinement failed for skeleton {[op.name for op in plan_skeleton]}, trying next")
+                should_break = False
+            elif config.break_on_satisfying:
                 should_break = True
 
         if should_break:
@@ -516,8 +681,30 @@ def run_cutamp(
 
     opt_elapsed = timer.stop("start_optimization")
     _log.debug(f"Optimization loop took roughly {opt_elapsed:.2f}s")
+    if found_solution and config.curobo_plan and curobo_plan is None:
+        found_solution = False
+        if failure_reason is None:
+            failure_reason = "Motion planning failed for all skeletons with satisfying particles"
     if not found_solution:
-        _log.warning("No satisfying particles found after optimizing all plans")
+        if len(plan_queue) == 0:
+            if num_skipped_plans > 0:
+                failure_reason = f"All {num_skipped_plans} plan skeleton(s) failed particle initialization"
+            else:
+                failure_reason = "No valid plan skeletons found for the given goal"
+        elif failure_reason is None:
+            # Had plans but no satisfying particles (or timed out)
+            optimized = overall_metrics["num_optimized_plans"]
+            total = len(plan_queue)
+            if optimized < total:
+                failure_reason = (
+                    f"No satisfying particles found after optimizing "
+                    f"{optimized}/{total} plan(s) (time budget {config.max_loop_dur}s exceeded)"
+                )
+            else:
+                failure_reason = (
+                    f"No satisfying particles found after optimizing all {total} plan(s)"
+                )
+        _log.warning(failure_reason)
     _log.debug(f"Best cost: {overall_metrics['best_cost']:.4f}, soft cost: {overall_metrics['best_soft_cost']:.4f}")
 
     # Dump metrics out
@@ -528,4 +715,4 @@ def run_cutamp(
     # Log constraint and cost multipliers
     exp_logger.log_dict("multipliers", cost_reducer.cost_config)
     exp_logger.log_dict("tolerances", constraint_checker.constraint_config)
-    return curobo_plan, overall_metrics["num_satisfying_final"]
+    return curobo_plan, overall_metrics["num_satisfying_final"], failure_reason

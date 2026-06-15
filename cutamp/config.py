@@ -17,11 +17,14 @@ class TAMPConfiguration:
     num_particles: int = 1024
 
     # Robot embodiment to use
-    robot: Literal["panda", "ur5"] = "panda"
+    robot: Literal["panda", "fr3_robotiq", "ur5", "panda_robotiq", "fr3_franka"] = "panda"
 
     # Grasp and Placements
     grasp_dof: Literal[4, 6] = 4
     place_dof: Literal[4] = 4
+
+    # M2T2 Grasps which will be used first, and then grasp_dof fallback
+    m2t2_grasps: bool = False
 
     # Approach to use. Note: optimization includes particle initialization (i.e., sampling)
     approach: Literal["optimization", "sampling"] = "optimization"
@@ -37,10 +40,18 @@ class TAMPConfiguration:
     ## Advanced args - for soft cost experiments. Warning! Might cause unexpected behavior if not used correctly.
     # Maximum time for optimization or sampling in seconds before breaking
     max_loop_dur: Optional[float] = None
+    # Proportion satisfying to break for optimization
+    prop_satisfying_break: Optional[float] = None
     # Whether to break upon finding a satisfying particle
     break_on_satisfying: bool = True
     # Whether we're running stick button experiment. Modifies heuristic for comparing baselines
     stick_button_experiment: bool = False
+
+    ## Experimental Stuff
+    # Whether to check placements using AABB or OBB formulation
+    placement_check: Literal["aabb", "obb"] = "aabb"
+    # Distance to shrink the placement region check on all sides, only supported for OBB right now
+    placement_shrink_dist: Optional[float] = None
 
     ## Soft Costs
     optimize_soft_costs: bool = False
@@ -65,6 +76,10 @@ class TAMPConfiguration:
     coll_sphere_radius: float = 0.005
     # Distance at which collision checking is activated between the world (in cuRobo)
     world_activation_distance: float = 0.0
+    # Mask out movable-to-world collision costs at timesteps before each object's first placement.
+    # Objects may initially be in collision with surfaces they rest on due to perception noise.
+    # Set to False in simulation or when debugging to surface genuine environment setup issues.
+    mask_initial_movable_world_collision: bool = True
     # Distance at which collision checking is activated between gripper and movables
     gripper_activation_distance: float = 0.0
     # Distance at which collision checking is activated between movables and movables
@@ -75,6 +90,8 @@ class TAMPConfiguration:
     enable_traj: bool = False
     # Motion plan with cuRobo after optimization
     curobo_plan: bool = False
+    # Max satisfying particles to try motion refinement on per skeleton (None = try all)
+    max_motion_refine_attempts: Optional[int] = None
     # For slowing down cuRobo motion plans (0.5 is safe on the real robot)
     time_dilation_factor: Optional[float] = None
     # Whether to warmup IK solver
@@ -101,7 +118,7 @@ class TAMPConfiguration:
 def validate_tamp_config(config: TAMPConfiguration):
     if config.num_particles <= 0:
         raise ValueError(f"num_particles must be positive, not {config.num_particles}")
-    if config.robot not in {"panda", "ur5"}:
+    if config.robot not in {"panda", "fr3_robotiq", "ur5", "panda_robotiq", "fr3_franka"}:
         raise ValueError(f"Invalid embodiment: {config.robot}")
     if config.grasp_dof not in {4, 6}:
         raise ValueError(f"Invalid grasp_dof: {config.grasp_dof}")
@@ -139,3 +156,13 @@ def validate_tamp_config(config: TAMPConfiguration):
         raise ValueError(f"world_activation_distance must be non-negative, not {config.world_activation_distance}")
     if config.movable_activation_distance < 0:
         raise ValueError(f"movable_activation_distance must be non-negative, not {config.movable_activation_distance}")
+
+    # Motion refinement
+    if config.max_motion_refine_attempts is not None and config.max_motion_refine_attempts <= 0:
+        raise ValueError(f"max_motion_refine_attempts must be positive or None, not {config.max_motion_refine_attempts}")
+
+    # Placement region checks
+    if config.placement_check != "obb" and config.placement_shrink_dist is not None:
+        raise NotImplementedError(
+            f"placement_shrink_dist only supported with placement_check = obb, not {config.placement_check}"
+        )

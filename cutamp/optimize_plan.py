@@ -20,6 +20,7 @@ from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
 from cutamp.cost_reduction import CostReducer
+from curobo.types.math import Pose as CuroboPose
 from cutamp.rollout import RolloutFunction
 from cutamp.tamp_domain import Conf, Grasp, Pose, Traj
 from cutamp.task_planning import PlanSkeleton
@@ -46,6 +47,12 @@ class ParticleOptimizer:
         self.cost_reducer = cost_reducer
         self.constraint_checker = constraint_checker
         self.get_satisfying_mask = self.constraint_checker.get_mask
+
+        self.num_satisfying_break = (
+            int(self.config.prop_satisfying_break * self.config.num_particles)
+            if self.config.prop_satisfying_break is not None
+            else None
+        )
 
         # Types to optimize
         self.types_to_optimize = {Pose, Conf}
@@ -79,8 +86,9 @@ class ParticleOptimizer:
         param_groups = []
         param_msg = []
         for param, val in particles.items():
-            param_type = param_to_type[param]
+            param_type = param_to_type.get(param)
             if param_type not in self.types_to_optimize:
+                _log.debug(f"Skipping {param} from optimizer group")
                 continue
             if param == "q0":
                 continue  # we don't optimize the initial configuration
@@ -138,11 +146,22 @@ class ParticleOptimizer:
             timer.start("optimization_step")
             optimizer.zero_grad()
 
-            rollout = rollout_fn(particles)
-            cost_dict = cost_fn(rollout)
-            costs = self.cost_reducer(cost_dict, consider_types=consider_types)
-            satisfying_mask = self.get_satisfying_mask(cost_dict, verbose=False)
+            with torch.profiler.record_function("rollout"):
+                rollout = rollout_fn(particles)
+            with torch.profiler.record_function("cost_fn"):
+                cost_dict = cost_fn(rollout)
+            with torch.profiler.record_function("cost_reduction"):
+                costs = self.cost_reducer(cost_dict, consider_types=consider_types)
+            with torch.profiler.record_function("satisfying_mask"):
+                satisfying_mask = self.get_satisfying_mask(cost_dict, verbose=False)
             num_satisfying = satisfying_mask.sum().item()
+            # If num satisfying bigger than desired proportion, break
+            if self.num_satisfying_break is not None and num_satisfying >= self.num_satisfying_break:
+                _log.info(
+                    f"Found {num_satisfying} >= {self.num_satisfying_break} ({self.config.prop_satisfying_break * 100:.2f}%) satisfying particles "
+                )
+                break
+
             opt_metrics["num_satisfying"].append(num_satisfying)
 
             if num_satisfying > 0 and not found_solution:
@@ -163,7 +182,8 @@ class ParticleOptimizer:
                 best_soft_cost = soft_costs[satisfying_mask].min().item() if num_satisfying > 0 else None
                 opt_metrics["best_soft_costs"].append(best_soft_cost)
 
-            torch.cuda.synchronize()
+            # Note: no cuda synchronize here — elapsed is approximate (CPU submission time).
+            # Accurate GPU timing is available via timer.stop("optimization_step") and --torch-profile.
             opt_metrics["elapsed"].append(time.perf_counter() - start_time)
 
             # Visualize the optimization progress. We do this before stepping the optimizer to see current state.
@@ -189,8 +209,10 @@ class ParticleOptimizer:
                 timer.stop("visualize_opt_rollout")
 
             # Compute gradients and step the optimizer
-            loss.backward()
-            optimizer.step()
+            with torch.profiler.record_function("backward"):
+                loss.backward()
+            with torch.profiler.record_function("optimizer_step"):
+                optimizer.step()
             timer.stop("optimization_step")
             pbar.set_description(
                 f"Loss: {loss:.3f}, Min: {costs.min():.3f}, {num_satisfying}/{self.config.num_particles} satisfying"
@@ -254,8 +276,11 @@ class ParticleOptimizer:
                 gripper_joints = []
             visualizer.set_joint_positions(q.tolist() + gripper_joints)
 
-            world_from_ee = rollout["world_from_ee"][best_idx, ts].cpu()
-            visualizer.log_mat4x4("rollout/ee_pose", world_from_ee)
+            ee_pose = CuroboPose(
+                position=rollout["ee_position"][best_idx, ts][None],
+                quaternion=rollout["ee_quaternion"][best_idx, ts][None],
+            )
+            visualizer.log_mat4x4("rollout/ee_pose", ee_pose.get_matrix()[0].cpu())
 
             robot_spheres = rollout["robot_spheres"][best_idx, ts].cpu()
             visualizer.log_spheres("rollout/robot_spheres", robot_spheres)

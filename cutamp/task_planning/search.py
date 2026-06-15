@@ -9,38 +9,82 @@
 
 import itertools
 import logging
-from collections import defaultdict
-from dataclasses import dataclass
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from typing import Generator, List, Optional, Sequence
 
 from cutamp.task_planning import Atom, GroundOperator, Operator, State
 
 _log = logging.getLogger(__name__)
 
+# Param types whose literals are fabricated by the planner during operator grounding
+# (see `_sample_param_type` in `get_valid_ground_operators`). The mapping value is the
+# prefix used when minting fresh symbols (e.g. q0, q1, ... for `conf`). Goal atoms of
+# these types do not need to be present in the initial state; goal atoms of any other
+# type must be, otherwise BFS would expand the frontier forever without ever satisfying
+# the goal. Both the sampler and the goal-state validator read from this single source
+# so they cannot drift out of sync.
+_FABRICABLE_TYPE_PREFIXES: dict[str, str] = {
+    "conf": "q",
+    "pose": "pose",
+    "traj": "traj",
+    "grasp": "grasp",
+}
+FABRICABLE_TYPES: frozenset[str] = frozenset(_FABRICABLE_TYPE_PREFIXES)
 
-@dataclass(frozen=True)
+
+@dataclass
 class _Node:
     state: frozenset[Atom]
     parent: Optional["_Node"]
     operator: Optional[GroundOperator]
     depth: int
+    _cached_params: Optional[dict[str, set[str]]] = field(default=None, compare=False, hash=False, repr=False)
+    _cached_fluent_map: Optional[dict[str, set[Atom]]] = field(default=None, compare=False, hash=False, repr=False)
+
+    def fluent_to_atoms_map(self) -> dict[str, set[Atom]]:
+        """Returns a mapping from fluent names to their corresponding atoms in this state."""
+        if self._cached_fluent_map is None:
+            # Build the map more efficiently by pre-sizing and using direct dict operations
+            fluent_map = {}
+            for atom in self.state:
+                name = atom.name
+                if name in fluent_map:
+                    fluent_map[name].add(atom)
+                else:
+                    fluent_map[name] = {atom}
+            self._cached_fluent_map = fluent_map
+        return self._cached_fluent_map
 
     def parameters(self) -> dict[str, set[str]]:
         """Returns all the parameters ever encountered"""
-        param_type_to_literals = self.parent.parameters() if self.parent else defaultdict(set)
+        if self._cached_params is not None:
+            return self._cached_params
+
+        if self.parent:
+            # Shallow copy the dict and shallow copy each set
+            param_type_to_literals = {k: v.copy() for k, v in self.parent.parameters().items()}
+        else:
+            param_type_to_literals = defaultdict(set)
 
         # All the literals in the state
         for atom in self.state:
             param_types = [param.type for param in atom.fluent.parameters]
             literals = atom.values
             for param_type, literal in zip(param_types, literals):
+                if param_type not in param_type_to_literals:
+                    param_type_to_literals[param_type] = set()
                 param_type_to_literals[param_type].add(literal)
 
         # All the literals in the operator
         if self.operator is not None:
             for param, values in zip(self.operator.operator.parameters, self.operator.values):
+                if param.type not in param_type_to_literals:
+                    param_type_to_literals[param.type] = set()
                 param_type_to_literals[param.type].add(values)
 
+        # Cache the result
+        self._cached_params = param_type_to_literals
         return param_type_to_literals
 
     def extract_solution(self) -> list[GroundOperator]:
@@ -55,7 +99,10 @@ class _Node:
 
 
 def get_valid_ground_operators(
-    node: _Node, operators: Sequence[Operator], verbose: bool = False
+    node: _Node,
+    operators: Sequence[Operator],
+    operator_precond_fluents: Sequence[frozenset[str]],
+    verbose: bool = False,
 ) -> list[GroundOperator]:
     """
     Get all valid ground operators by testing the operators, binding samples for the unspecified variables, and
@@ -64,44 +111,55 @@ def get_valid_ground_operators(
     ground_ops = []
     state = node.state
 
-    # Fluent names to their corresponding atoms
-    fluent_to_atoms: dict[str, set[Atom]] = defaultdict(set)
-    for atom in state:
-        fluent_to_atoms[atom.name].add(atom)
+    # Use cached fluent-to-atoms mapping from the node
+    fluent_to_atoms = node.fluent_to_atoms_map()
+
+    # Pre-filter operators based on precondition fluent availability
+    # Skip operators whose required fluents don't exist in the current state
+    # Use pre-computed precondition fluent sets for faster subset checking
+    available_fluent_names = frozenset(fluent_to_atoms.keys())
+    relevant_operators = [
+        op
+        for op, pre_fluents in zip(operators, operator_precond_fluents)
+        if pre_fluents.issubset(available_fluent_names)
+    ]
+
+    if verbose and len(relevant_operators) < len(operators):
+        _log.debug(
+            f"Filtered operators from {len(operators)} to {len(relevant_operators)} "
+            f"based on available fluents: {available_fluent_names}"
+        )
 
     # For each operator, we try to ground it given the current state
-    for operator in operators:
+    for operator in relevant_operators:
         # FIXME: this sampling is slow once we have lots of plan skeletons, so improve it in the future
         # Got to do it inside here so we reset for each operator
         param_type_to_literals = node.parameters()
 
         # This is hacky and could break things due to naming, but ok for now
         def _sample_param_type(param_type: str) -> str:
-            if param_type in param_type_to_literals:
-                if param_type == "conf":
-                    # remove the 'q' prefix
-                    conf_nums = {int(lit[1:]) for lit in param_type_to_literals[param_type]}
-                    conf_max = max(conf_nums)
-                    return f"q{conf_max + 1}"
-                elif param_type == "pose":
-                    pose_nums = {int(lit[4:]) for lit in param_type_to_literals[param_type]}
-                    pose_max = max(pose_nums)
-                    return f"pose{pose_max + 1}"
-                elif param_type == "traj":
-                    traj_nums = {int(lit[4:]) for lit in param_type_to_literals[param_type]}
-                    traj_max = max(traj_nums)
-                    return f"traj{traj_max + 1}"
-                elif param_type == "grasp":
-                    grasp_nums = {int(lit[5:]) for lit in param_type_to_literals[param_type]}
-                    grasp_max = max(grasp_nums)
-                    return f"grasp{grasp_max + 1}"
-                else:
-                    raise NotImplementedError
-            else:
-                return f"{param_type}1"
+            # Only fabricable types can be minted by the planner. Non-fabricable types
+            # (movable, surface, ...) must come from the initial state — the goal-state
+            # validator at the top of breadth_first_search relies on this invariant.
+            if param_type not in _FABRICABLE_TYPE_PREFIXES:
+                raise NotImplementedError(
+                    f"Cannot fabricate fresh symbols for non-fabricable type '{param_type}'; "
+                    f"literals of this type must come from the initial state."
+                )
+            prefix = _FABRICABLE_TYPE_PREFIXES[param_type]
+            if param_type not in param_type_to_literals:
+                # First time we see this type — mint the seed symbol (e.g. "q1").
+                return f"{prefix}1"
+            # Existing literals follow the convention `<prefix><N>` (e.g. q0, q1, pose3).
+            # Strip the prefix to recover N for each existing literal, then mint a fresh
+            # symbol one past the current max — e.g. {q0, q1, q2} -> "q3".
+            existing_nums = {int(lit[len(prefix):]) for lit in param_type_to_literals[param_type]}
+            return f"{prefix}{max(existing_nums) + 1}"
 
         def sample_param_type(param_type: str) -> str:
             new_sample = _sample_param_type(param_type)
+            if param_type not in param_type_to_literals:
+                param_type_to_literals[param_type] = set()
             param_type_to_literals[param_type].add(new_sample)
             return new_sample
 
@@ -156,7 +214,9 @@ def get_valid_ground_operators(
             substitutions = dict(zip(param_names, combo))
             ground_op = operator.ground(substitutions)
 
-            # Check preconditions are satisfied
+            # Check preconditions are satisfied for this specific parameter combination
+            # Note: We checked fluent availability earlier, but not all parameter combinations
+            # will have their preconditions satisfied in the state
             if not ground_op.preconditions.issubset(state):
                 if verbose:
                     _log.debug(f"Skipping {ground_op} because not all preconditions are satisfied.")
@@ -205,12 +265,35 @@ def breadth_first_search(
         if not isinstance(elem, Atom):
             raise ValueError(f"Goal state must contain only atoms, got {elem.__class__.__name__} {elem}")
 
+    # Reject goal atoms whose literals can never appear in any reachable state.
+    # Operator sampling fabricates fresh symbols only for FABRICABLE_TYPES; literals
+    # of any other type (movable, surface, ...) must already be in the initial state,
+    # otherwise BFS expands fresh samples forever without satisfying the goal.
+    initial_literals_by_type: dict[str, set[str]] = defaultdict(set)
+    for atom in initial_state:
+        for param, value in zip(atom.fluent.parameters, atom.values):
+            initial_literals_by_type[param.type].add(value)
+    for atom in goal_state:
+        for param, value in zip(atom.fluent.parameters, atom.values):
+            if param.type in FABRICABLE_TYPES:
+                continue
+            if value not in initial_literals_by_type.get(param.type, set()):
+                known = sorted(initial_literals_by_type.get(param.type, set()))
+                raise ValueError(
+                    f"Goal atom {atom} references unknown {param.type} literal "
+                    f"'{value}' that does not appear in the initial state. "
+                    f"Known {param.type} literals: {known}"
+                )
+
+    # Pre-compute precondition fluent sets for each operator (optimization)
+    operator_precond_fluents = [frozenset(pre.name for pre in op.preconditions) for op in operators]
+
     initial_node = _Node(state=initial_state, parent=None, operator=None, depth=0)
-    frontier: list[_Node] = [initial_node]
+    frontier: deque[_Node] = deque([initial_node])
     explored: set[State] = {initial_node.state}
 
     while frontier:
-        node = frontier.pop(0)
+        node = frontier.popleft()
         if verbose:
             _log.debug(f"Exploring node: {node}")
 
@@ -222,7 +305,7 @@ def breadth_first_search(
                 continue  # stop exploring this branch as we already satisfied the goal
 
         # Get successor and add to frontier
-        ground_ops = get_valid_ground_operators(node, operators, verbose=verbose)
+        ground_ops = get_valid_ground_operators(node, operators, operator_precond_fluents, verbose=verbose)
         for ground_op in ground_ops:
             successor_state = ground_op.apply(node.state)
 
