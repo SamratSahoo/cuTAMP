@@ -10,3 +10,6 @@ __pycache__/
 
 # MacOS
 .DS_Store
+__pycache__/
+*.pyc
+*.egg-info/
