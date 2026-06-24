@@ -10,6 +10,7 @@
 """Core cuTAMP algorithm implementation."""
 
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import List, Union, Optional, Tuple
@@ -342,7 +343,11 @@ def setup_cutamp(
     # Validate args and setup experiment logger
     validate_tamp_config(config)
     if experiment_id is None:
-        experiment_id = datetime.now().isoformat().split(".")[0]
+        # Microseconds + PID keep this unique across concurrently-running planners (e.g. multiple
+        # tiptop servers sharing experiment_root). The old per-second id made two plans that started
+        # in the same second share an experiment dir and collide ("File .../opt_0001.json already
+        # exists") in ExperimentLogger.log_dict.
+        experiment_id = f"{datetime.now().isoformat()}_{os.getpid()}"
 
     exp_logger = (
         ExperimentLogger(name=experiment_id, config=config, experiment_dir=experiment_dir)
