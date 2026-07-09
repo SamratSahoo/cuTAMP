@@ -58,3 +58,35 @@ def get_world_collision_cost(
     world_collision_cost = PrimitiveCollisionCost(collision_cost_config)
     _log.debug(f"Created {world_collision_cost} with activation distance {collision_activation_distance}")
     return world_collision_cost
+
+
+def get_batched_world_collision_cost(
+    world_configs: list[WorldConfig],
+    tensor_args: TensorDeviceType,
+    collision_activation_distance: float,
+    weight: float = 1.0,
+) -> PrimitiveCollisionCost:
+    """Batched (n_envs) PrimitiveCollisionCost for Phase-2b particle-opt across scenes.
+
+    Registers N scene worlds at once (n_envs = len(world_configs)); a later collision query passes
+    env_query_idx to route each sphere row to its own scene's obstacles. Call as
+    ``cost(spheres, env_query_idx=idx)`` where idx is an int32 CUDA tensor of length == spheres.shape[0]
+    mapping each row to its env in [0, N). Mirrors get_world_collision_cost but with a world LIST.
+    """
+    if collision_activation_distance < 0.0:
+        raise ValueError(f"Collision activation distance must be >= 0.0, not {collision_activation_distance}")
+
+    obb_worlds = [WorldConfig.create_obb_world(wc) for wc in world_configs]
+    coll_dict = {"checker_type": "PRIMITIVE", "max_distance": 0.1}
+    collision_config = WorldCollisionConfig.load_from_dict(coll_dict, obb_worlds, tensor_args)  # list -> n_envs
+    world_collision_checker = create_collision_checker(collision_config)
+    collision_cost_config = PrimitiveCollisionCostConfig(
+        tensor_args.to_device([weight]),
+        tensor_args,
+        return_loss=True,
+        world_coll_checker=world_collision_checker,
+        activation_distance=collision_activation_distance,
+    )
+    world_collision_cost = PrimitiveCollisionCost(collision_cost_config)
+    _log.debug(f"Created batched {world_collision_cost} over {len(world_configs)} envs")
+    return world_collision_cost
