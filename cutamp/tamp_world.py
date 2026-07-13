@@ -201,6 +201,21 @@ class TAMPWorld:
         """
         Get the cuRobo motion generator for the robot. If you're debugging, you should set `use_cuda_graph=False`
         """
+        robot_cfg = self._curobo_robot_cfg()
+
+        # World config needs to include movables for cuRobo
+        world_cfg = get_world_cfg(self.env, include_movables=True)
+        motion_gen_cfg = MotionGenConfig.load_from_robot_config(
+            robot_cfg=robot_cfg,
+            world_model=world_cfg,
+            use_cuda_graph=use_cuda_graph,
+            collision_activation_distance=collision_activation_distance,
+        )
+        motion_gen = MotionGen(motion_gen_cfg)
+        return motion_gen
+
+    def _curobo_robot_cfg(self) -> dict:
+        """Robot cfg for cuRobo with the attached_object sphere budget set to the worst-case movable."""
         if self.robot_name == "panda":
             robot_cfg = franka_curobo_cfg()
         elif self.robot_name == "panda_robotiq":
@@ -217,16 +232,52 @@ class TAMPWorld:
         max_num_spheres = max([len(sphs) for sphs in self._obj_to_spheres.values()])
         robot_cfg["robot_cfg"]["kinematics"]["extra_collision_spheres"]["attached_object"] = max_num_spheres
         _log.info(f"Setting number of spheres for attachments to {max_num_spheres}")
+        return robot_cfg
 
-        # World config needs to include movables for cuRobo
-        world_cfg = get_world_cfg(self.env, include_movables=True)
+    def get_batched_motion_gen(
+        self, n_envs: int, collision_activation_distance: float, collision_cache: dict | None = None,
+        world_cfgs: list | None = None, num_batch_trajopt_seeds: int = 1,
+    ) -> MotionGen:
+        """Batched-env MotionGen (Phase 2): refine n_envs scenes in one plan_batch_env call.
+
+        Mirrors get_motion_gen but with an n_envs-length world_model and a batched warmup. CUDA graphs
+        are unsupported in batch mode (plan_batch_env bakes env/seed counts into the solve), so
+        use_cuda_graph is forced False. By default all n_envs are seeded with THIS world's geometry
+        (identical copies); pass `world_cfgs` (a list of n_envs WorldConfigs) to give each env its own
+        scene geometry. Per-env object poses are swapped later via update_obstacle_pose(..., env_idx=b).
+        """
+        robot_cfg = self._curobo_robot_cfg()
+        # NOTE on the shared attached_object budget: scaling it up for a multi-env UNION blob was
+        # tried and abandoned -- x16 (800 spheres) OOMs the self-collision buffers on a shared L40,
+        # and any reduced cover bulges below the true toy surface and kills held segments at n_envs=16.
+        # The blob is instead the ANCHOR env's exact sphere set; grasp-aligned rank selection
+        # (_aligned_rows) makes it approximately correct for the other envs.
+        if world_cfgs is None:
+            world_cfgs = [get_world_cfg(self.env, include_movables=True) for _ in range(n_envs)]
+        elif len(world_cfgs) != n_envs:
+            raise ValueError(f"n_envs={n_envs} but got {len(world_cfgs)} world_cfgs")
+        if collision_cache is None:
+            collision_cache = {"obb": 48, "mesh": 24}
         motion_gen_cfg = MotionGenConfig.load_from_robot_config(
             robot_cfg=robot_cfg,
-            world_model=world_cfg,
-            use_cuda_graph=use_cuda_graph,
+            world_model=world_cfgs,
+            use_cuda_graph=False,
+            n_collision_envs=n_envs,
+            num_batch_trajopt_seeds=num_batch_trajopt_seeds,
+            # Disable BOTH particle-opt (MPPI) stages -- IK's and trajopt's. The CUDA faults originally
+            # blamed on MPPI kernels (jobs 3505702/3505743/3505820) were actually a warp-mesh
+            # use-after-free in batched world loading -- the fork's warp cache was keyed by mesh NAME, so
+            # n_envs>=2 builds freed earlier envs' meshes; whichever kernel ran next surfaced the async
+            # corruption. Fixed in curobo world_mesh.py by keying the cache on (env_idx, name). The
+            # L-BFGS-from-seed config below is what was offline-validated for batched equivalence, so it
+            # stays; re-enabling MPPI stages is an optional future A/B for success-rate.
+            ik_particle_opt=False,
+            trajopt_particle_opt=False,
+            collision_cache=collision_cache,
             collision_activation_distance=collision_activation_distance,
         )
         motion_gen = MotionGen(motion_gen_cfg)
+        motion_gen.warmup(enable_graph=False, batch=n_envs, warmup_js_trajopt=False, batch_env_mode=True)
         return motion_gen
 
 

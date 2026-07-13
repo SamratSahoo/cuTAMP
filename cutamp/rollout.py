@@ -82,6 +82,13 @@ class RolloutFunction:
         # Flag for first rollout, used to apply a runtime check
         self._is_first_rollout = True
 
+        # Phase 2b (batched particle opt across scenes): when set, particles are laid out as
+        # `n_scenes` contiguous blocks of `particles_per_scene`, and each block seeds its objects from
+        # its OWN scene's initial pose. batched_initial_poses maps name -> [n_scenes, 4, 4]. Default
+        # None keeps the single-scene path (one shared initial pose expanded over all particles).
+        self.batched_initial_poses: dict[str, torch.Tensor] | None = None
+        self.particles_per_scene: int | None = None
+
     def __call__(self, particles: Particles) -> Rollout:
         """
         Rollout particles given the plan skeleton through the world. We keep the rollout information minimal to avoid
@@ -129,10 +136,20 @@ class RolloutFunction:
                     grasp_to_mat4x4[grasp_name_] = self.grasp_to_mat4x4_fn(grasp_)
             return grasp_to_mat4x4[grasp_name_]
 
-        # Object poses in world frame for every timestep
-        obj_to_pose = {
-            obj.name: [self.obj_to_initial_pose[obj.name].expand(num_particles, -1, -1)] for obj in self.world.movables
-        }
+        # Object poses in world frame for every timestep. Single-scene: one initial pose expanded over
+        # all particles. Batched (2b): each scene's block seeds from its own [n_scenes,4,4] pose via
+        # repeat_interleave (block layout, particle INNER) -> [n_scenes*particles_per_scene, 4, 4].
+        if self.batched_initial_poses is not None:
+            pps = self.particles_per_scene
+            obj_to_pose = {
+                obj.name: [self.batched_initial_poses[obj.name].repeat_interleave(pps, dim=0)]
+                for obj in self.world.movables
+            }
+        else:
+            obj_to_pose = {
+                obj.name: [self.obj_to_initial_pose[obj.name].expand(num_particles, -1, -1)]
+                for obj in self.world.movables
+            }
 
         def current_pose(obj: str) -> Float[torch.Tensor, "num_particles 4 4"]:
             return obj_to_pose[obj][-1]

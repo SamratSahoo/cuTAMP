@@ -59,6 +59,25 @@ class CostFunction:
         self.config = config
         self._rollout_validated = False
 
+        # Phase 2b: when set, route world-collision queries to a batched checker (n_envs = n_scenes)
+        # via env_query_idx instead of the single-scene world.collision_fn, so each 256-particle block
+        # is checked against its own scene's obstacles. Both None = single-scene path (unchanged).
+        self.batched_collision_fn = None  # PrimitiveCollisionCost over n_scenes worlds, or None
+        self.scene_env_idx: torch.Tensor | None = None  # int32 [n_particles] mapping each row -> scene
+        # Per-scene placement-surface targets (batched groups). The __init__ caches below
+        # (surface_to_aabb/obb/target_z) come from ONE world -- the group representative's -- which
+        # silently pulls every scene's placements toward the REP's surface pose (scene-6 randomizes the
+        # plate per scene; measured: non-rep group members got ~0 satisfying particles). When set (by
+        # run_cutamp_batched._solve_group), stable_placement_costs gathers each particle row's OWN
+        # scene's surface geometry via scene_env_idx. {surface: {stacked per-scene tensors}} -- aabb
+        # mode: xy_lower/xy_upper [S,2] + target_z [S]; obb mode: center [S,3], rot_inv [S,3,3],
+        # half_xy [S,2], target_z [S].
+        self.batched_surfaces: dict | None = None
+        # Per-scene object collision spheres ({name: [S, n, 4]}), same rationale as batched_surfaces:
+        # by default __call__ uses the REP world's spheres for every scene, i.e. every scene's toys
+        # are cost-evaluated with the rep's toy shapes. Gathered per particle row via scene_env_idx.
+        self.batched_obj_spheres: dict | None = None
+
         # Accumulate the constraints, so we can batch them up when computing the costs
         self.cfree_constraints = []
         self.kinematic_constraints = []
@@ -395,9 +414,23 @@ class CostFunction:
             spheres = torch.cat(surface_to_spheres[surface], dim=1)
             spheres_xy = spheres[..., :2]
 
+            # Per-scene surface geometry (batched groups): gather each particle row's own scene's
+            # surface via scene_env_idx; bs None falls back to the single-world __init__ caches.
+            bs = (
+                self.batched_surfaces.get(surface)
+                if self.batched_surfaces is not None and self.scene_env_idx is not None
+                else None
+            )
+            rows = self.scene_env_idx.long() if bs is not None else None
+
             # Within goal xy bounds, need to gather by the spheres for each object
             if self.config.placement_check == "aabb":
-                in_goal_xy = dist_from_bounds_jit(spheres_xy, *self.surface_to_aabb[surface])
+                if bs is not None:
+                    in_goal_xy = dist_from_bounds_jit(
+                        spheres_xy, bs["xy_lower"][rows][:, None, :], bs["xy_upper"][rows][:, None, :]
+                    )
+                else:
+                    in_goal_xy = dist_from_bounds_jit(spheres_xy, *self.surface_to_aabb[surface])
                 obj_in_goal_xy = torch.zeros(
                     (num_particles, len(objs)), dtype=in_goal_xy.dtype, device=in_goal_xy.device
                 )
@@ -405,19 +438,26 @@ class CostFunction:
                 support_vals[f"{surface}_in_xy"] = obj_in_goal_xy
             else:
                 # Check spheres are within the OBB's xy plane by transforming to OBB local frame
-                obb = self.surface_to_obb[surface]
-
-                # Transform sphere centers to OBB local frame using cached rotation matrix
                 sphere_centers = spheres[..., :3]  # (b, n, 3)
-                centers_relative = sphere_centers - obb.center  # translate to OBB origin
-                centers_local = centers_relative @ obb.rot_matrix_inv.T  # rotate to OBB frame
+                if bs is not None:
+                    # Row-wise OBB transform: each particle row uses its own scene's surface OBB
+                    centers_relative = sphere_centers - bs["center"][rows][:, None, :]
+                    centers_local = torch.einsum("pnk,pik->pni", centers_relative, bs["rot_inv"][rows])
+                    half_xy = bs["half_xy"][rows][:, None, :]
+                    in_goal_xy = dist_from_bounds_jit(centers_local[..., :2], -half_xy, half_xy)
+                else:
+                    obb = self.surface_to_obb[surface]
 
-                # Now everything's in local frame just use AABB check
-                centers_xy = centers_local[..., :2]  # (b, n, 2)
-                # com_xy = centers_xy.mean(1)[:, None]
-                obb_xy_lower = -obb.half_extents[:2]
-                obb_xy_upper = obb.half_extents[:2]
-                in_goal_xy = dist_from_bounds_jit(centers_xy, obb_xy_lower, obb_xy_upper)
+                    # Transform sphere centers to OBB local frame using cached rotation matrix
+                    centers_relative = sphere_centers - obb.center  # translate to OBB origin
+                    centers_local = centers_relative @ obb.rot_matrix_inv.T  # rotate to OBB frame
+
+                    # Now everything's in local frame just use AABB check
+                    centers_xy = centers_local[..., :2]  # (b, n, 2)
+                    # com_xy = centers_xy.mean(1)[:, None]
+                    obb_xy_lower = -obb.half_extents[:2]
+                    obb_xy_upper = obb.half_extents[:2]
+                    in_goal_xy = dist_from_bounds_jit(centers_xy, obb_xy_lower, obb_xy_upper)
 
                 # Accumulate per-object distances
                 obj_in_goal_xy = torch.zeros(
@@ -432,7 +472,7 @@ class CostFunction:
                 (num_particles, len(objs)), float("inf"), dtype=spheres_bottom.dtype, device=spheres_bottom.device
             )
             obj_bottom.scatter_reduce_(1, sphere_idx_map_expand, spheres_bottom, reduce="amin")
-            target_z = self.surface_to_target_z[surface]
+            target_z = self.surface_to_target_z[surface] if bs is None else bs["target_z"][rows][:, None]
             support_vals[f"{surface}_support"] = torch.abs(obj_bottom - target_z)
 
         stable_placement_cost = {
@@ -451,12 +491,19 @@ class CostFunction:
         }
         return traj_cost
 
+    def _world_collision(self, spheres, env_query_idx):
+        """Route a world-collision query: batched (n_scenes) checker + env_query_idx in 2b mode, else
+        the single-scene world.collision_fn (env_query_idx ignored)."""
+        if self.batched_collision_fn is not None:
+            return self.batched_collision_fn(spheres, env_query_idx=env_query_idx)
+        return self.world.collision_fn(spheres)
+
     def collision_costs(self, rollout: Rollout, obj_to_spheres: Dict[str, Float[torch.Tensor, "b t n 4"]]) -> dict:
         """Collision costs."""
-        # Robot to world
+        # Robot to world (row i -> scene scene_env_idx[i] in 2b mode)
         robot_spheres = rollout["robot_spheres"]
         with torch.profiler.record_function("coll::robot_to_world"):
-            coll_values = {"robot_to_world": self.world.collision_fn(robot_spheres)}
+            coll_values = {"robot_to_world": self._world_collision(robot_spheres, self.scene_env_idx)}
 
         # Collision between movables and world — batch all activated objects in one collision_fn call,
         # then mask out timesteps before each object's first placement. The motion solver handles this
@@ -464,7 +511,12 @@ class CostFunction:
         # spheres cause an invalid start state during retract planning.
         with torch.profiler.record_function("coll::movable_to_world"):
             stacked = torch.stack([obj_to_spheres[obj] for obj in self._activated_objs])
-            coll = self.world.collision_fn(rearrange(stacked, "objs b t n d -> (objs b) t n d"))
+            # The rearrange is 'objs b -> (objs b)' (obj OUTER, particle INNER), so tile the per-particle
+            # scene map over the object axis with .repeat (NOT repeat_interleave).
+            movable_env_idx = (
+                self.scene_env_idx.repeat(len(self._activated_objs)) if self.scene_env_idx is not None else None
+            )
+            coll = self._world_collision(rearrange(stacked, "objs b t n d -> (objs b) t n d"), movable_env_idx)
             coll = rearrange(coll, "(objs b) t -> objs b t", objs=len(self._activated_objs))
             if self.config.mask_initial_movable_world_collision:
                 if self._movable_world_mask is None:
@@ -592,7 +644,19 @@ class CostFunction:
                 if obj.name in obj_to_spheres:
                     raise RuntimeError(f"Object {obj.name} already in obj_to_spheres")
                 obj_pose = rollout["obj_to_pose"][obj.name]
-                obj_spheres = transform_spheres(self.world.get_collision_spheres(obj), obj_pose)
+                if (
+                    self.batched_obj_spheres is not None
+                    and self.scene_env_idx is not None
+                    and obj.name in self.batched_obj_spheres
+                ):
+                    # Each particle row uses its OWN scene's sphere set. transform_spheres assumes a
+                    # single [n,4] set, so transform inline: [P,T,1,4,4] @ [P,1,n,4,1] -> [P,T,n,4].
+                    sph = self.batched_obj_spheres[obj.name][self.scene_env_idx.long()]  # [P, n, 4]
+                    centers_hom = torch.cat([sph[..., :3], torch.ones_like(sph[..., :1])], dim=-1)
+                    obj_spheres = (obj_pose[:, :, None] @ centers_hom[:, None, :, :, None]).squeeze(-1)
+                    obj_spheres[..., 3] = sph[..., 3][:, None]
+                else:
+                    obj_spheres = transform_spheres(self.world.get_collision_spheres(obj), obj_pose)
                 obj_to_spheres[obj.name] = obj_spheres
 
         # Collision costs
