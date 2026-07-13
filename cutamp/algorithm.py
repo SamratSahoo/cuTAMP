@@ -1219,7 +1219,11 @@ def run_cutamp_batched(
                            cost_fn=CostFunction(skel_rank, sc["world"], config))
             try:
                 ranked_per.append(get_ranked_satisfying_particles(pinfo_i, config, constraint_checker, cost_reducer, sc["vis"]))
-            except RuntimeError:
+            except (RuntimeError, AssertionError):
+                # RuntimeError = "no satisfying particles". AssertionError = the rare phantom/rank
+                # mismatch (rollout.py pose-timestep check on a padded scene whose skeleton_rank omits
+                # a phantom that is still in world.movables); both mean this scene can't be ranked, so
+                # drop just it (None) instead of letting the exception kill the whole group.
                 ranked_per.append(None)
 
         solvable = [i for i in range(g) if ranked_per[i] is not None]
