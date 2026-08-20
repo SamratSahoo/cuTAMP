@@ -112,6 +112,29 @@ class TAMPConfiguration:
     # float("inf") is the max joint displacement (the infinity-norm). Both lower-bound the shortest
     # collision-free path length between the two configurations.
     traj_length_norm: float = 2.0
+    # Height (metres) of an explicit APEX waypoint inserted into each free-space transit of a Pick or
+    # Place -- the long unconstrained leg between the retract and the pre-grasp/pre-place pose. The
+    # transit is planned as start -> apex -> goal instead of start -> goal, where the apex sits at the
+    # horizontal midpoint of the two end-effector positions, `transit_apex_height` above the HIGHER of
+    # them, carrying the goal orientation.
+    #
+    # Why an explicit waypoint rather than a cost: cuRobo's trajopt objective is entirely joint-space
+    # (bound_cfg's L2 on acceleration/jerk plus the limit hinges) and has no term reading the
+    # end-effector's Cartesian path, so with fixed endpoints its optimum is the joint-space geodesic --
+    # the EE skims across the table in a low lateral sweep. Splitting the transit at an apex changes
+    # the endpoints themselves, which is the only lever that shapes the Cartesian path without adding
+    # a new cost term.
+    #
+    # 0.0 (default) disables it: the transit is planned exactly as before, one plan_single call.
+    # Applies to the single-arm solver (solve_curobo) only. If either apex leg fails to plan, the
+    # solver silently falls back to the direct transit, so enabling this can never lose a plan that
+    # would otherwise have been found.
+    transit_apex_height: float = 0.0
+    # Minimum horizontal (xy) distance between the transit's start and goal end-effector positions for
+    # the apex to be inserted. Short transits -- an object placed right next to where it was picked --
+    # get a pointless up-and-down from an apex, so they keep the direct plan. Ignored when
+    # transit_apex_height is 0.
+    transit_apex_min_dist: float = 0.10
     # Whether to also optimize full trajectories (not supported right now)
     enable_traj: bool = False
     # Motion plan with cuRobo after optimization
@@ -201,6 +224,12 @@ def validate_tamp_config(config: TAMPConfiguration):
     # Trajectory length norm (torch.norm requires p >= 1; inf is allowed for the max-norm)
     if config.traj_length_norm < 1:
         raise ValueError(f"traj_length_norm must be >= 1 (or inf), not {config.traj_length_norm}")
+
+    # Transit apex waypoint
+    if config.transit_apex_height < 0:
+        raise ValueError(f"transit_apex_height must be non-negative, not {config.transit_apex_height}")
+    if config.transit_apex_min_dist < 0:
+        raise ValueError(f"transit_apex_min_dist must be non-negative, not {config.transit_apex_min_dist}")
 
     # Motion refinement
     if config.max_motion_refine_attempts is not None and config.max_motion_refine_attempts <= 0:
