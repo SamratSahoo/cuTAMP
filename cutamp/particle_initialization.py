@@ -56,6 +56,15 @@ from cutamp.utils.shapes import MultiSphere
 _log = logging.getLogger(__name__)
 
 
+class NoGraspsError(RuntimeError):
+    """Perception proposed no grasps for an object that must be picked.
+
+    Raised only when ``TAMPConfiguration.require_m2t2_grasps`` is set; otherwise the heuristic
+    sampler stands in and a warning is logged. See ``_sample_grasps``.
+    """
+
+
+
 # --------------------------------------------------------------------------------------------- #
 # Teleop-posture IK branch selection                                                             #
 # --------------------------------------------------------------------------------------------- #
@@ -335,6 +344,38 @@ class ParticleInitializer:
         unchanged. Returns ``(selected_grasps, selected_confs, is_mat4x4)``.
         """
         config, world = self.config, self.world
+
+        n_m2t2 = len(self.grasps.get(obj, {}).get("grasps_obj", ())) if self.grasps else 0
+        if config.m2t2_grasps and n_m2t2 == 0:
+            # Perception proposed NOTHING for this object and the heuristic samplers below will
+            # quietly stand in -- sampling grasps off the object's COLLISION-SPHERE approximation,
+            # with no perception and no confidence behind them. On a plush toy that reconstructs as
+            # a lumpy blob of spheres, that is a grasp pose with no evidence any graspable geometry
+            # is there, and it is a direct mechanism for closing on empty air.
+            #
+            # Measured over the shipped runs' scene_objects.json
+            # (analysis_dataset_diff/TELEOP_VS_APEX.md, Finding 5): 43% of objects in
+            # 1_pp_toys_plate_vae_style_timing_apex_posture and 18% in ..._learned_posture had ZERO
+            # M2T2 candidates, and every one of them was picked anyway on these fallback grasps.
+            # It was invisible because the only trace was a _log.debug.
+            #
+            # The warning is unconditional -- a silent substitution of a different grasp source is
+            # never what a caller wants to not be told about. The raise is opt-in via
+            # `require_m2t2_grasps`, because failing here changes planning outcomes for every
+            # existing config and some of them legitimately rely on the heuristic path.
+            _log.warning(
+                f"No M2T2 grasps for {obj}: falling back to {config.grasp_dof}-DOF HEURISTIC grasps "
+                f"sampled from its collision spheres, not from perception. These miss far more "
+                f"often. Raise perception.m2t2.num_runs (tamp_overrides `m2t2_num_runs`) to give "
+                f"this object candidates; set `require_m2t2_grasps` to fail instead of guessing."
+            )
+            if config.require_m2t2_grasps:
+                raise NoGraspsError(
+                    f"no M2T2 grasp candidates for {obj!r} and require_m2t2_grasps is set. The "
+                    f"heuristic fallback would sample grasps from this object's collision spheres "
+                    f"rather than from perception."
+                )
+
         # Sample grasps
         obj_curobo = world.get_object(obj)
         num_faces = 4 if isinstance(obj_curobo, Cuboid) else None
@@ -343,7 +384,7 @@ class ParticleInitializer:
         sampled_confs = None
         is_mat4x4 = False
 
-        if config.m2t2_grasps and self.grasps and len(self.grasps[obj]["grasps_obj"]) > 0:
+        if config.m2t2_grasps and n_m2t2 > 0:
             _log.debug(f"Using M2T2 grasps for {obj}")
             provided_grasps = self.grasps[obj]["grasps_obj"]
             confs = self.grasps[obj]["confidences_pt"]

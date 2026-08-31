@@ -13,6 +13,37 @@ import torch
 from jaxtyping import Float
 
 
+def cost_breakdown(cost_dict: Dict[str, dict], idx: int, cost_reducer: "CostReducer") -> dict:
+    """Per-term cost values for a single particle, for logging.
+
+    Mirrors CostReducer.get_cost so recorded numbers match the objective: each entry sums over the
+    time dimension and reports raw value, the applied weight (an ABSENT multiplier is 1.0, as in the
+    reducer), and their product. ``kind`` is "cost" (soft) or "constraint" (hard). Keyed
+    "<CostType>/<name>", e.g. "GraspCost/grasp_rot_change", "TrajectoryLength/traj_length".
+
+    Module-level rather than a ParticleOptimizer method because the optimizer is not the only thing
+    that needs it: the particle that gets EXECUTED is chosen after optimization, by
+    ``get_ranked_satisfying_particles``, and is a different particle whenever that ranking is not
+    soft-cost ordered.
+    """
+    breakdown = {}
+    for cost_type, entry in cost_dict.items():
+        for name, values in entry["values"].items():
+            v = values[idx]
+            if v.ndim >= 1:
+                v = v.sum()  # sum over time, matching the reducer
+            raw = v.item()
+            mult = cost_reducer.cost_to_multiplier.get((cost_type, name))
+            weight = 1.0 if mult is None else float(mult)
+            breakdown[f"{cost_type}/{name}"] = {
+                "raw": raw,
+                "weight": weight,
+                "weighted": raw * weight,
+                "kind": entry["type"],
+            }
+    return breakdown
+
+
 class CostReducer:
     """Reduces the cost dictionary to a single cost per particle by applying a weighted sum of costs."""
 

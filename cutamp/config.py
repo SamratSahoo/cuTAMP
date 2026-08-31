@@ -41,6 +41,18 @@ class TAMPConfiguration:
     # M2T2 Grasps which will be used first, and then grasp_dof fallback
     m2t2_grasps: bool = False
 
+    # Fail instead of silently falling back to heuristic grasps when M2T2 proposes NOTHING for an
+    # object that has to be picked. With m2t2_grasps on, a zero-candidate object is currently NOT
+    # dropped: `_sample_grasps` falls through to grasp_4dof_sampler/grasp_6dof_sampler, which sample
+    # grasps from the object's collision-sphere approximation rather than from perception. Measured
+    # over shipped runs, 18-43% of picked objects took that path, and it is a direct mechanism for
+    # closing on empty air (analysis_dataset_diff/TELEOP_VS_APEX.md, Finding 5).
+    #
+    # Default False so every existing config keeps its current planning outcomes; the fallback is
+    # warned about either way. Turn on for data collection, where a guessed grasp that misses costs
+    # a whole mislabelled episode. Opt in from cfg/tamp with `require_m2t2_grasps: true`.
+    require_m2t2_grasps: bool = False
+
     # Approach to use. Note: optimization includes particle initialization (i.e., sampling)
     approach: Literal["optimization", "sampling"] = "optimization"
 
@@ -84,6 +96,24 @@ class TAMPConfiguration:
     # here (default off) for the same weight-1.0 reason as grasp_orientation_cost above; the weight is
     # set separately via constraint_to_mult[GraspCost.type]["grasp_center_offset"].
     grasp_center_cost: bool = False
+    # Weight on summed M2T2 grasp confidence when RANKING the satisfying particles that motion
+    # refinement is attempted on (get_ranked_satisfying_particles), scoring each particle
+    # `soft_cost - weight * summed_confidence`, lower first.
+    #
+    # None (the default, and the historical behaviour) ranks on confidence ALONE whenever M2T2
+    # confidences are present, which is every TiPToP run. That ranking ignores every soft cost, and
+    # since cuRobo almost always succeeds on the first-ranked particle, the EXECUTED grasp is just
+    # the argmax-confidence candidate -- so grasp_center_cost / grasp_orientation_cost influence
+    # nothing but the logged breakdown. Measured over the 22 shipped runs of
+    # 4_pack_toys_..._learned_posture_v2, the executed grasp was confidence rank 0 in 48/66 picks
+    # and within the top 4 in all 66, sitting at a uniformly random offset percentile of the
+    # candidate pool (banana 58th, toys 41st) despite grasp_center_weight=30.
+    #
+    # Set this to fold the soft costs back into that ranking. Confidence is kept in the score rather
+    # than dropped: it is the only signal that the grasp is on real graspable geometry, and ranking
+    # on soft cost alone would happily pick a centred grasp on a reconstruction artifact. 0.0 means
+    # rank on soft cost alone.
+    grasp_rank_conf_weight: Optional[float] = None
 
     ## Task Planning and subgraph caching
     # Number of initial plans to sample
@@ -291,6 +321,12 @@ def validate_tamp_config(config: TAMPConfiguration):
     # Motion refinement
     if config.max_motion_refine_attempts is not None and config.max_motion_refine_attempts <= 0:
         raise ValueError(f"max_motion_refine_attempts must be positive or None, not {config.max_motion_refine_attempts}")
+    # Negative would rank LOW-confidence grasps first, which is never what a caller means. 0.0 is
+    # allowed and means rank on soft cost alone.
+    if config.grasp_rank_conf_weight is not None and config.grasp_rank_conf_weight < 0:
+        raise ValueError(
+            f"grasp_rank_conf_weight must be non-negative or None, not {config.grasp_rank_conf_weight}"
+        )
 
     # Placement region checks
     if config.placement_check != "obb" and config.placement_shrink_dist is not None:
