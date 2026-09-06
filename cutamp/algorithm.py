@@ -25,7 +25,7 @@ from curobo.wrap.reacher.motion_gen import MotionGen
 from cutamp.config import TAMPConfiguration, validate_tamp_config
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
-from cutamp.cost_reduction import CostReducer
+from cutamp.cost_reduction import CostReducer, cost_breakdown
 from cutamp.envs.utils import TAMPEnvironment
 from cutamp.experiment_logger import ExperimentLogger
 from cutamp.motion_solver import solve_curobo, solve_curobo_dual, MotionPlanningError
@@ -158,7 +158,25 @@ def get_ranked_satisfying_particles(
     cost_reducer: CostReducer,
     visualizer: Visualizer | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Get the satisfying particles ranked by grasp confidence (if available) or soft costs."""
+    """Get the satisfying particles ranked for motion refinement, best first.
+
+    This ranking, not the optimizer's cost, is what decides the plan that actually runs: the caller
+    walks it in order and keeps the FIRST particle cuRobo can motion plan, which is rank 0 on nearly
+    every run. Anything the ranking ignores has no effect on the executed grasp.
+
+    Historically (``config.grasp_rank_conf_weight is None``) it ranks on summed M2T2 grasp
+    confidence alone whenever confidences are present -- so on a TiPToP run the executed grasp is
+    the argmax-confidence candidate and the GraspCost soft costs, which the optimizer cannot touch
+    either (grasps are not in ``types_to_optimize``, and ``optimize_soft_costs`` defaults to False),
+    influence only the logged ``best_cost_breakdown`` of a DIFFERENT particle. Setting
+    ``grasp_rank_conf_weight`` scores ``soft_cost - weight * summed_confidence`` instead, which is
+    what gives ``grasp_center_weight`` and ``grasp_pose_change_weight`` a say in what is executed.
+
+    Note the confidence sum skips any grasp parameter whose ``*_confidences`` is None, which is how
+    an object that fell back to the heuristic sampler contributes nothing while its neighbours
+    contribute their full confidence -- particles are then ranked on partial information.
+    ``require_m2t2_grasps`` rules that case out.
+    """
     particles, rollout_fn, cost_fn = plan_info["particles"], plan_info["rollout_fn"], plan_info["cost_fn"]
     with torch.no_grad():
         rollout = rollout_fn(particles)
@@ -180,16 +198,58 @@ def get_ranked_satisfying_particles(
             grasp_confs = conf if grasp_confs is None else (grasp_confs + conf)
     satisfying_grasp_confs = grasp_confs[satisfying_mask] if grasp_confs is not None else None
 
-    # Rank satisfying particles by grasp confidence (if available) or soft costs
+    # Rank satisfying particles: by grasp confidence alone (the default, and the only option before
+    # grasp_rank_conf_weight existed), otherwise by soft cost less the weighted confidence. Without
+    # confidences at all -- every object on the heuristic sampler -- soft cost is all there is.
     indices = torch.arange(config.num_particles, device=satisfying_costs.device)
     satisfying_idxs = indices[satisfying_mask]
+    conf_weight = config.grasp_rank_conf_weight
     use_grasp_ranking = satisfying_grasp_confs is not None
-    if use_grasp_ranking:
+    if use_grasp_ranking and conf_weight is None:
         sorted_idxs = satisfying_grasp_confs.argsort(descending=True)  # Higher confidence is better
+        rank_scores = -satisfying_grasp_confs
     else:
-        sorted_idxs = satisfying_costs.argsort()  # Lower cost is better
+        # Lower is better. Soft costs are in the reducer's weighted units (metres x
+        # grasp_center_weight, radians x grasp_pose_change_weight, ...), so conf_weight is set
+        # against those, not against a normalized confidence.
+        rank_scores = satisfying_costs
+        if use_grasp_ranking:
+            rank_scores = rank_scores - float(conf_weight) * satisfying_grasp_confs
+        sorted_idxs = rank_scores.argsort()
     ranked_idxs = satisfying_idxs[sorted_idxs]
     ranked_particles = {k: v[ranked_idxs].detach().clone() for k, v in particles.items() if v is not None}
+
+    # Per-rank diagnostics for the particle that will actually be executed. Without these the only
+    # per-term numbers logged anywhere are `best_cost_breakdown`'s, which describe the best-SOFT-COST
+    # particle -- a different one from the executed particle whenever the ranking is not soft-cost
+    # ordered, and the reason this ranking's effect on grasp choice went unnoticed. Kept as plain
+    # lists (one entry per satisfying particle, in ranked order) so the caller can log rank i.
+    # Per-SOFT-TERM raw values too, so the arrays answer the question the executed particle alone
+    # cannot: whether a cheaper grasp existed among the satisfying particles and the ranking passed
+    # it over, or whether every satisfying particle was equally bad and the candidate pool (or the
+    # constraints) is the binding thing. Raw, matching _cost_breakdown, so grasp_center_offset reads
+    # in metres.
+    soft_terms = {}
+    for cost_type, entry in cost_dict.items():
+        if entry["type"] != "cost":
+            continue
+        for name, values in entry["values"].items():
+            v = values[satisfying_mask]
+            if v.ndim == 2:
+                v = v.sum(dim=1)  # sum over time / over grasp params, matching the reducer
+            soft_terms[f"{cost_type}/{name}"] = v[sorted_idxs].tolist()
+
+    plan_info["ranked_diagnostics"] = {
+        "rank_score": rank_scores[sorted_idxs].tolist(),
+        "soft_cost": satisfying_costs[sorted_idxs].tolist(),
+        "grasp_conf_sum": (
+            satisfying_grasp_confs[sorted_idxs].tolist() if use_grasp_ranking else None
+        ),
+        "soft_terms": soft_terms,
+        "grasp_rank_conf_weight": conf_weight,
+        "particle_idx": ranked_idxs.tolist(),
+    }
+    plan_info["ranked_cost_dict"] = cost_dict  # for the executed rank's per-term breakdown
 
     # Visualize the best particle
     if visualizer is not None:
@@ -197,6 +257,55 @@ def get_ranked_satisfying_particles(
         _visualize_best_particle(visualizer, rollout, best_idx, rollout_fn.world, config)
 
     return ranked_particles
+
+
+def log_executed_particle(
+    plan_info: dict,
+    cost_reducer: CostReducer,
+    rank: int,
+    exp_logger: ExperimentLogger,
+    key: str,
+) -> None:
+    """Record the per-term costs of the particle whose plan is actually returned.
+
+    ``best_cost_breakdown`` describes the best-soft-cost particle, which is NOT the one executed
+    unless the ranking happens to be soft-cost ordered -- so a cost can look dominant there while
+    having no influence on the grasp that runs. This logs the executed particle's own terms, plus
+    where it sat in the ranking, so that discrepancy is visible in
+    ``<exp_dir>/optimization/executed_*.json`` rather than having to be reconstructed by FK'ing the
+    saved plan.
+
+    ``rank_score`` is whatever the ranking sorted on, so its scale differs between the two branches
+    -- negated confidence under the default ranking, ``soft_cost - w * confidence`` once
+    ``grasp_rank_conf_weight`` is set. Compare ``soft_cost`` and ``cost_breakdown`` across runs;
+    ``rank_score`` is only meaningful against other ranks of the same run.
+    """
+    diagnostics = plan_info.get("ranked_diagnostics")
+    cost_dict = plan_info.get("ranked_cost_dict")
+    if not diagnostics or cost_dict is None or rank >= len(diagnostics["particle_idx"]):
+        return
+    conf_sums = diagnostics["grasp_conf_sum"]
+    record = {
+        "rank": rank,
+        "num_satisfying": len(diagnostics["particle_idx"]),
+        "particle_idx": diagnostics["particle_idx"][rank],
+        "rank_score": diagnostics["rank_score"][rank],
+        "soft_cost": diagnostics["soft_cost"][rank],
+        "grasp_conf_sum": None if conf_sums is None else conf_sums[rank],
+        "grasp_rank_conf_weight": diagnostics["grasp_rank_conf_weight"],
+        "cost_breakdown": cost_breakdown(cost_dict, diagnostics["particle_idx"][rank], cost_reducer),
+        # Every satisfying particle, in ranked order -- what the executed one was chosen OVER.
+        "ranking": {k: v for k, v in diagnostics.items() if k != "grasp_rank_conf_weight"},
+    }
+    exp_logger.log_dict(key, record)
+    _log.info(
+        f"[Executed] rank {rank}/{record['num_satisfying']} particle, soft cost "
+        f"{record['soft_cost']:.4g}, grasp conf sum {record['grasp_conf_sum']}: "
+        + ", ".join(
+            f"{name}={term['weighted']:.4g}"
+            for name, term in sorted(record["cost_breakdown"].items(), key=lambda kv: -kv[1]["weighted"])
+        )
+    )
 
 
 def sample_plan_skeleton(
@@ -726,6 +835,13 @@ def run_cutamp(
                         )
                         _log.info("Successful plan found!")
                         failure_reason = None
+                        log_executed_particle(
+                            plan_info,
+                            cost_reducer,
+                            curr_idx,
+                            exp_logger,
+                            f"optimization/executed_{opt_iter:04d}",
+                        )
                         break
                     except MotionPlanningError as e:
                         _log.warning(f"Failed to motion plan: {e}")

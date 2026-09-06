@@ -34,14 +34,70 @@ Measured consequence: **80–90% of the deviation from human configurations live
 segments, not inside them.** That is exactly the part no trajopt cost can reach, because trajopt's
 endpoints are already pinned by the time it runs. It is why `joint_density_weight` never moved it.
 
-## 3. The fix in one sentence
+## 3. The fix
 
-Ask IK for `k` branches instead of 1, and keep the one that looks most like how a human holds the
-arm. The two baked tables define "looks most like".
+Two levers, both at the IK endpoint:
+
+1. **Branch selection** — ask IK for `k` branches instead of 1 and keep the most probable under a
+   density fit to human configurations (§4).
+2. **Grasp roll** — also solve the pi-rolled twin of the grasp and keep the better of the two (§6).
+
+Lever 1 alone gets the residual from ~47% to ~41%; the two together reach **7–14%** (§9). Lever 2 is
+the larger one, because a wrist roll is a property of the *grasp*, and both branches of a single
+pose share it — no amount of branch selection can reach it.
 
 ---
 
-## 4. Table A — where humans put their joints
+## 4. The model: a learned density over configurations
+
+Given `k` IK branches for **one** pose, the principled choice is
+
+$$\arg\max_q \, p(q \mid \text{pose})$$
+
+On the manifold of configurations reaching that pose the normaliser is identical for every branch,
+so this reduces exactly to $\arg\max p(q)$ — a plain density over human configurations. No pose
+conditioning needs modelling.
+
+The density is a **full-covariance Gaussian mixture** fit to the standardised reference corpus:
+
+$$\text{penalty}(q) = -\log p_{\text{GMM}}(q)
+= -\log \sum_{k=1}^{K} \pi_k \, \mathcal{N}\!\left(z; \mu_k, \Sigma_k\right),
+\qquad z = \frac{q - \bar q}{\sigma_q}$$
+
+Evaluated with the precision Cholesky factors $P_k$ ($\Sigma_k^{-1} = P_k P_k^\top$) for stability:
+
+$$\log \mathcal{N}_k = \underbrace{\log \pi_k + \textstyle\sum_d \log (P_k)_{dd}}_{\text{baked constant}}
+- \tfrac{1}{2}\big\|(z - \mu_k)^\top P_k\big\|^2$$
+
+The additive constant $\tfrac12 J \log 2\pi$ is dropped — identical for every branch, so it cannot
+change an argmin. Evaluation is pure torch; `sklearn` is needed only to bake. Verified against
+`sklearn.score_samples` to **1e-14**.
+
+### Choosing K
+
+By held-out log-likelihood on an **episode-level** split (frames within an episode are highly
+correlated, so a frame split leaks):
+
+| K | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|---|---|
+| held-out LL | −9.21 | −8.01 | −7.52 | −7.21 | **−7.06** | **−6.96** | −6.96 | −7.06 |
+
+Flat between 16 and 32 and turning over by 64. K=16 is shipped: it matched K=32 on the downstream
+selection metric while being half the size and less prone to overfitting a re-bake on a smaller
+corpus. The artifact is 12.7 KB.
+
+---
+
+## 5. Fallback model: the pairwise tables
+
+Retained for references baked with `--gmm-k 0`, and worth reading because it explains what the
+density has to capture. It penalises joint-**pair** differences outside the human range, weighted by
+how free each pair is to move:
+
+$$\text{penalty}(q) = \sum_{i<j} w_{ij}\Big[\max(0, d_{ij} - \texttt{hi}_{ij}) +
+\max(0, \texttt{lo}_{ij} - d_{ij})\Big], \qquad d_{ij} = q_i - q_j$$
+
+### 5a. Table A — where humans put their joints
 
 ### Input
 
@@ -102,7 +158,7 @@ min/max would be useless: the full range of `q1−q3` is 10 radians, which permi
 
 ---
 
-## 5. Table B — which pairs are the planner's to choose
+### 5b. Table B — which pairs are the planner's to choose
 
 Table A says *where* humans put each pair. Table B says *which pairs the planner may move without
 fighting the task*. It comes from geometry only — no human behaviour enters it.
@@ -180,7 +236,47 @@ nothing. No hand-tuning, no exclusion list.
 
 ---
 
-## 6. What happens at plan time
+## 6. The grasp roll
+
+A parallel jaw is invariant to a pi roll about its approach axis, so **every grasp has two equally
+valid end-effector poses**:
+
+$$T^{\text{ee}}_{\text{alt}} = T^{\text{ee}} \cdot R_z(\pi)$$
+
+cuTAMP only ever builds one of them — whichever representative M2T2 emitted — and roughly half the
+time that is the wrist branch teleoperation never uses. Both IK branches of a single pose inherit
+that pose's roll, so §4's selection cannot reach it. `solve_with_grasp_roll` solves both poses and
+selects across the union.
+
+**The stored grasp is rolled to match.** For this arm the roll commutes with the tool offset,
+
+$$T^{\text{tool}}_{\text{ee}} \, R_z(\pi) \, \left(T^{\text{tool}}_{\text{ee}}\right)^{-1} = R_z(\pi)$$
+
+verified exactly, so the *same* matrix applies on the grasp side: wherever the twin wins,
+`obj_from_grasp` is post-multiplied by $R_z(\pi)$. Measured grasp/configuration consistency after
+selection: **0.02 mm / 0.04°**. Only applies where the grasp is a 4x4 (M2T2 grasps) — the 4/6-DOF
+sampled parameterisations cannot carry a roll, and are skipped.
+
+Applied at **Pick** only. At Place the grasp is already bound by the preceding Pick, so rolling
+there would contradict it; Place gets branch selection alone.
+
+### Two cuRobo hazards this path had to work around
+
+Both were found by measurement, and both silently produce plausible-but-wrong results:
+
+**`solve_batch` normalises its goal quaternion in place, and `Pose` objects alias cuRobo's internal
+goal buffer.** A goal held across a *second* solve is overwritten — measured drift **1.41** on a
+unit quaternion, i.e. the first goal literally becomes the second. `Pose.clone()` does not protect
+it. The fix is structural: **score each pool immediately after its own solve**, while its goal is
+still intact. Deferring the scoring made every branch of the first pool fail its FK check, so the
+twin won 100% of the time and the comparison was meaningless — it read as a 41% residual instead of
+the true 7%.
+
+**Changing the IK batch size trips the cuda graph** (`"changing goal type, cuda graph reset not
+available"`). The two poses must therefore be two *same-size* `solve_batch` calls, not one
+double-width batch.
+
+## 7. What happens at plan time
 
 `select_posture_branch` runs once per IK solve, for each of the `k` returned branches:
 
@@ -190,19 +286,14 @@ instead: within `posture_pos_tol` (5 mm) and `posture_rot_tol` (0.05 rad ≈ 2.9
 filters non-reaching solutions the stock path accepts blindly — max FK error over 512 endpoints was
 6.19 mm / 60.7° stock versus 0.01 mm selected.
 
-**Step 2 — score the posture.**
-
-$$\text{penalty}(q) = \sum_{i<j} w_{ij}\Big[\max(0,\; d_{ij} - \texttt{hi}_{ij}) +
-\max(0,\; \texttt{lo}_{ij} - d_{ij})\Big], \qquad d_{ij} = q_i - q_j$$
-
-A **one-sided hinge**: exactly zero inside the human band, and the distance outside it (in radians)
-otherwise, weighted by that pair's freeness.
+**Step 2 — score the posture**, `penalty = -log p(q)` under the baked mixture (§4), or the pairwise
+hinge if the reference was baked without one (§5). With `posture_grasp_roll` on, the pi-rolled twin
+pose is solved and scored the same way and the two pools are concatenated (§6).
 
 **Step 3 — keep the argmin**, with invalid branches masked to $+\infty$.
 
-Because in-band costs exactly zero, this does not force the arm into one posture. It pushes back
-only when a branch leaves the range humans use; among acceptable branches all penalties tie at 0 and
-`argmin` returns the lowest index — cuRobo's own preference.
+Note the density gives a *strict* ranking — unlike the pairwise hinge, which is exactly zero
+anywhere inside the bands and therefore deferred to cuRobo's own ordering among in-band branches.
 
 ### Fallbacks
 
@@ -217,14 +308,17 @@ Selection can never lose a plan the stock configuration would have found:
 
 ---
 
-## 7. Configuration
+## 8. Configuration
 
 One knob:
 
 ```yaml
 tamp_overrides:
-  posture_selection_seeds: 12     # branches to score; 0 or 1 = off
+  posture_selection_seeds: 12     # branches to score per endpoint; 0 or 1 = off
+  posture_grasp_roll: true        # also try the pi-rolled twin grasp (default true)
 ```
+
+Ready-made configs: `data-collection/cfg/tamp/*_learned_posture.yml` (one per task).
 
 Everything else — which joints matter, how far they may vary — comes from the baked file. Nothing to
 tune per scene, per task or per object.
@@ -237,7 +331,7 @@ exceed the solver's `num_seeds`, and branch diversity thins as the two converge.
 
 ---
 
-## 8. Baking and porting
+## 9. Baking and porting
 
 ```bash
 # default: DROID proprio shard cache, FR3
@@ -261,35 +355,53 @@ an *output*, not an input.
 
 ---
 
-## 9. Measured results
+## 10. Measured results
 
-512 endpoints, `k = 12`, scored by a 24-component GMM fit to DROID configurations — an independent
-yardstick, not the selector's own objective:
+Scored by **5-NN distance to held-out DROID episodes** — non-parametric and from a different model
+family than the selector, so no mixture appears in the metric. DROID is split **by episode** (80/20;
+a frame split leaks, since frames within an episode are highly correlated), the prior is fit on
+train, the yardstick built on held-out.
 
-| | GMM logL | q1−q3 sd | max FK error |
-|---|---|---|---|
-| stock (cuRobo top seed) | −12.55 | 0.98 | 0.01 mm |
-| **posture selection** | **−10.96** | 0.44 | 0.02 mm |
-| DROID itself (ceiling) | −6.62 | 0.50 | — |
+% of selected configurations beyond held-out DROID's own p99 in 7-D:
 
-Cost is ~24 ms per IK batch at 512 particles, against multi-second plans.
+| task | stock | + branch selection | + grasp roll | twin won |
+|---|---|---|---|---|
+| plate | 41% | ~41% | **12%** | 48% |
+| fruits | 47% | 41% | **7%** | 54% |
+| pack | 42% | ~42% | **14%** | 41% |
+| held-out DROID (ceiling) | — | — | 1% | — |
 
-**Nothing is hand-picked.** The baked table independently recovers `q1−q3` as by far the freest pair
-(w = 0.728, band [−0.44, +0.56]), then `q3−q5` (0.395) and `q1−q7` (0.263) — the coordinate that
-diagnosis had identified by hand falls out of the geometry instead of being assumed.
+Earlier, on the same yardstick, the pairwise tables scored 43–49% and the density 41–46% — i.e.
+**the model upgrade was worth a few points and the grasp roll was worth ~30**. That ordering is the
+main practical finding: the residual was never a ranking problem.
 
----
+Corroborating this, an **oracle** that picks the yardstick-optimal branch from a pool of 96
+candidates for the *given* pose still leaves 37%. The given pose was the ceiling; the twin pose is
+what breaks it.
 
-## 10. Limitations
+End-effector poses are unchanged (grasp/configuration consistency 0.02 mm / 0.04°); cost is one
+extra IK batch per endpoint, ~24 ms at 512 particles against multi-second plans.
 
-**Table A is a product of marginals.** Each pair's band is estimated independently, so it cannot
-express "`q1−q3` may be wide *when* `q5−q7` is narrow". It is the same class of simplification that
-made `joint_density` fail — but one level up, on pair differences rather than single joints, which
-is where the signal turned out to live.
+## 11. Limitations
 
-**5/95 is a policy choice, not a fact.** It rejects the outer 10% of human behaviour. Tighter would
-reject postures humans genuinely use; looser would admit the tails being removed. It is the one free
-parameter in Table A.
+**A GMM is a global, unimodal-per-component model of a manifold-like distribution.** Human
+configurations concentrate near a low-dimensional set; a mixture approximates that with ellipsoids.
+K=16 was chosen by held-out likelihood, but likelihood rewards covering probability mass, not
+capturing the manifold's shape — a normalising flow would fit better at the cost of a far larger
+artifact and a training loop.
+
+**It is a density, not a constraint.** Unlike the pairwise hinge, every branch gets a strictly
+positive penalty, so the selector always expresses a preference even when all branches are
+perfectly reasonable. That is what makes it stronger, and also what makes it less auditable: there
+is no "this is fine" region you can read off a table.
+
+**The residual is 7–14%, against 1% for DROID itself.** Selection can only choose among what IK
+proposes; closing the last gap means changing what is generated (seeding, or the grasp set), not how
+it is ranked.
+
+**The pairwise fallback is a product of marginals over pairs.** It cannot express "`q1−q3` may be
+wide *when* `q5−q7` is narrow", and it is provably blind to common mode (§9). Its 5/95 cut is also
+a policy choice, not a fact.
 
 **$\mathbb{E}[N]$ averages projectors**, which is meaningful only if the null space is reasonably
 stable across the sampled region. It is here — the arm works in a tabletop volume — but on a robot
@@ -303,12 +415,8 @@ task — not that the planner currently gets it wrong. Those correlate only **+0
 would spend effort on pairs that are already fine; pairing it with Table A's bands is what makes the
 penalty zero when nothing is wrong.
 
-**The q7 π-flip is not addressed.** 30–46% of planned frames sit on the wrist branch teleoperation
-never uses. That is a property of the **grasp**, not the IK branch — the two representatives are two
-different EE poses. Solving IK for both a grasp and its π-rolled twin takes q7 out-of-band from 50%
-to 0%, but it must also flip the stored `obj_from_grasp` to match, so it is a separate change.
-(Whoever does it: issue two same-size `solve_batch` calls — doubling the batch trips cuRobo's cuda
-graph with *"changing goal type"*.)
+**The roll is applied at Pick only** (§6), and only for M2T2 4x4 grasps. A scene whose grasps come
+from the 4/6-DOF samplers gets branch selection alone.
 
 **Everything above is offline.** Real recorded poses, real IK, real trajopt — but never a live scene
 with obstacles. `k` branches are scored before collision pruning in these measurements; in clutter

@@ -157,7 +157,34 @@ def make_jacobian_fn(robot: str, chunk: int = 512):
 # --------------------------------------------------------------------------------------------- #
 # the bake                                                                                       #
 # --------------------------------------------------------------------------------------------- #
-def bake(qs, jac_fn, n_joints, pct=(5, 95), n_jac=4000, seed=0, provenance=""):
+def fit_gmm(qs, n_components, seed=0, max_fit=120_000):
+    """Fit a full-covariance GMM to standardised configurations; return bakeable arrays.
+
+    Selection among IK branches for one pose is argmax p(q | pose), and on the manifold of
+    configurations reaching that pose p(q | pose) is proportional to p(q) -- the normaliser is the
+    same for every branch. So a plain density over configurations IS the conditional MAP here, with
+    no need to model the pose dependence.
+
+    ``sklearn`` is needed only to FIT; evaluation at plan time is pure torch (posture_prior.py).
+    """
+    from sklearn.mixture import GaussianMixture
+
+    rng = np.random.default_rng(seed)
+    mu, sc = qs.mean(0), qs.std(0)
+    x = (qs - mu) / sc
+    if len(x) > max_fit:
+        x = x[rng.choice(len(x), max_fit, replace=False)]
+    g = GaussianMixture(
+        n_components, covariance_type="full", random_state=seed, reg_covar=1e-4, max_iter=200
+    ).fit(x)
+    return dict(
+        gmm_weights=g.weights_, gmm_means=g.means_,
+        gmm_prec_chol=g.precisions_cholesky_,      # [K, J, J], upper-triangular factors of Sigma^-1
+        gmm_mu=mu, gmm_scale=sc, gmm_k=n_components,
+    )
+
+
+def bake(qs, jac_fn, n_joints, pct=(5, 95), n_jac=4000, seed=0, provenance="", gmm_k=16):
     """qs: [N, dof] configurations. jac_fn: q[M, dof] -> J[M, 6, dof]. Returns a np.savez dict."""
     qs = np.asarray(qs, dtype=np.float64)[:, :n_joints]
     lo = np.zeros((n_joints, n_joints))
@@ -183,10 +210,14 @@ def bake(qs, jac_fn, n_joints, pct=(5, 95), n_jac=4000, seed=0, provenance=""):
             v[i], v[j] = 1.0, -1.0
             v /= np.sqrt(2.0)
             w[i, j] = float(v @ A @ v)
-    return dict(
+    out = dict(
         pair_lo=lo, pair_hi=hi, pair_weight=w, n_joints=n_joints, n_frames=len(qs),
         n_jac_samples=len(sub), percentiles=np.asarray(pct), provenance=provenance,
+        model="gmm" if gmm_k else "pairwise",
     )
+    if gmm_k:
+        out.update(fit_gmm(qs, gmm_k, seed=seed))
+    return out
 
 
 def main():
@@ -197,6 +228,8 @@ def main():
     ap.add_argument("--robot", default="fr3_franka")
     ap.add_argument("--n-joints", type=int, default=7)
     ap.add_argument("--max-episodes", type=int, default=4000)
+    ap.add_argument("--gmm-k", type=int, default=16,
+                    help="GMM components (0 = bake the pairwise tables only)")
     args = ap.parse_args()
 
     loader = load_droid_shards if args.source == "droid" else load_lerobot
@@ -205,9 +238,11 @@ def main():
     prov = f"{args.source}:{Path(args.path).name} robot={args.robot} " \
            f"{len(episodes)} episodes, {len(qs)} non-idle frames"
 
-    out = bake(qs, make_jacobian_fn(args.robot), n_joints=args.n_joints, provenance=prov)
+    out = bake(qs, make_jacobian_fn(args.robot), n_joints=args.n_joints,
+               provenance=prov, gmm_k=args.gmm_k)
     np.savez(args.out, **out)
-    print(f"wrote {args.out}\n  {prov}")
+    print(f"wrote {args.out}\n  {prov}\n  model={out['model']}"
+          + (f" K={args.gmm_k}" if args.gmm_k else ""))
     iu = np.triu_indices(args.n_joints, 1)
     for k in np.argsort(out["pair_weight"][iu])[::-1][:6]:
         i, j = iu[0][k], iu[1][k]

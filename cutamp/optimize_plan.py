@@ -19,7 +19,7 @@ from cutamp.utils.common import Particles
 from cutamp.config import TAMPConfiguration
 from cutamp.constraint_checker import ConstraintChecker
 from cutamp.cost_function import CostFunction
-from cutamp.cost_reduction import CostReducer
+from cutamp.cost_reduction import CostReducer, cost_breakdown
 from curobo.types.math import Pose as CuroboPose
 from cutamp.rollout import RolloutFunction
 from cutamp.tamp_domain import Conf, Grasp, Pose, Traj
@@ -60,29 +60,8 @@ class ParticleOptimizer:
         self.opt_counter = 0
 
     def _cost_breakdown(self, cost_dict: dict, idx: int) -> dict:
-        """Per-term cost values for a single particle, for logging.
-
-        Mirrors CostReducer.get_cost so recorded numbers match the objective: each entry sums over the
-        time dimension and reports raw value, the applied weight (an ABSENT multiplier is 1.0, as in the
-        reducer), and their product. ``kind`` is "cost" (soft) or "constraint" (hard). Keyed
-        "<CostType>/<name>", e.g. "GraspCost/grasp_rot_change", "TrajectoryLength/traj_length".
-        """
-        breakdown = {}
-        for cost_type, entry in cost_dict.items():
-            for name, values in entry["values"].items():
-                v = values[idx]
-                if v.ndim >= 1:
-                    v = v.sum()  # sum over time, matching the reducer
-                raw = v.item()
-                mult = self.cost_reducer.cost_to_multiplier.get((cost_type, name))
-                weight = 1.0 if mult is None else float(mult)
-                breakdown[f"{cost_type}/{name}"] = {
-                    "raw": raw,
-                    "weight": weight,
-                    "weighted": raw * weight,
-                    "kind": entry["type"],
-                }
-        return breakdown
+        """Per-term cost values for a single particle. See cost_reduction.cost_breakdown."""
+        return cost_breakdown(cost_dict, idx, self.cost_reducer)
 
     def __call__(self, plan_info: PlanContainer, timer: TorchTimer, visualizer: Visualizer) -> Tuple[bool, dict, bool]:
         """

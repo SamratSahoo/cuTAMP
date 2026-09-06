@@ -103,6 +103,24 @@ class Atom:
         # Equality also based on string representation (same fluent + same values)
         return isinstance(other, Atom) and str(self) == str(other)
 
+    def __setstate__(self, state):
+        """Recompute the cached hash after unpickling, in THIS process's hash seed.
+
+        ``_cached_hash`` is ``hash(str)``, and Python salts string hashing per process, so an Atom
+        restored from a pickle carries a hash no other Atom in this process would ever produce. It
+        still compares equal to its freshly built twin -- ``__eq__`` is on the string -- but lands in
+        a different bucket, so ``atom in state`` is False and the two are distinct members of the
+        same set. That silently breaks anything that unpickles a TAMPEnvironment: BFS grounds its
+        goal atoms fresh, never matches the unpickled ``goal_state``, and reports "No valid plan
+        skeletons found for the given goal" on a goal that plans fine live -- which is exactly what
+        ``perception/cutamp_env.pkl`` is saved to let you debug.
+
+        Frozen dataclass, so the state is written through ``object.__setattr__``.
+        """
+        for key, value in state.items():
+            object.__setattr__(self, key, value)
+        object.__setattr__(self, "_cached_hash", hash(self._cached_str))
+
     def __repr__(self) -> str:
         return str(self)
 
