@@ -8,6 +8,7 @@
 # its affiliates is strictly prohibited.
 
 import itertools
+from functools import reduce
 import logging
 from collections import defaultdict
 from typing import Dict, Union
@@ -39,7 +40,7 @@ from cutamp.task_planning.constraints import (
 )
 from cutamp.task_planning.costs import GraspCost, TrajectoryLength
 from cutamp.utils.common import transform_spheres
-from cutamp.utils.obb import get_object_obb
+from cutamp.utils.support import Footprint, footprint_from_object
 
 _log = logging.getLogger(__name__)
 
@@ -153,24 +154,43 @@ class CostFunction:
         # Compute the AABB and surface z-position for the placement surfaces
         self.surface_to_aabb = {}
         self.surface_to_obb = {}
+        # Placement yaw a surface's support region requires, per surface; None where any yaw works.
+        self.surface_to_yaw = {}
         self.surface_to_target_z = {}
         self.surface_to_objs = defaultdict(list)
+        # Collect the objects per surface BEFORE fitting any region: a "support" region has to fit
+        # the largest object that lands on the surface, which is not knowable from the first
+        # constraint mentioning it.
         for con in self.stable_placement_constraints:
             obj, _, _, surface = con.params
             self.surface_to_objs[surface].append(obj)
-            if surface in self.surface_to_aabb:
-                continue
 
+        for surface in self.surface_to_objs:
             if self.config.placement_check == "aabb":
                 aabb = world.get_aabb(surface)  # includes xyz
                 aabb_xy = aabb[:, :2]
                 self.surface_to_aabb[surface] = aabb_xy
                 surface_z = aabb[1, 2]
             else:
-                assert self.config.placement_check == "obb"
-                surface_obj = world.get_object(surface)
-                obb = get_object_obb(surface_obj, shrink_dist=config.placement_shrink_dist)
+                assert self.config.placement_check in ("obb", "support")
+                # Through the world, not get_object_obb directly, so this is the SAME region the
+                # placement sampler drew from -- and so a "support" region is fitted to an object
+                # that actually has to fit on it.
+                # Several objects may share a surface; the region has to hold all of them, so the
+                # footprint fitted for is the one that contains every footprint.
+                footprint = reduce(
+                    Footprint.union,
+                    (
+                        footprint_from_object(world.get_object(obj), world.get_collision_spheres(obj))
+                        for obj in self.surface_to_objs[surface]
+                    ),
+                )
+                # A "support" region is already the set of valid object CENTRES, which is exactly
+                # what the cost below constrains (it measures the object's origin against the
+                # region), so it goes in as fitted.
+                obb, object_yaw = world.placement_obb(surface, footprint, self.config)
                 self.surface_to_obb[surface] = obb
+                self.surface_to_yaw[surface] = object_yaw
                 surface_z = obb.surface_z
 
             # For target z, need to take collision activation distance into account
@@ -288,6 +308,7 @@ class CostFunction:
         self.pair_to_first_pose_ts = {}
         self._activated_objs = sorted(self.activated_obj)  # deterministic ordering for torch.stack
         self._movable_world_mask = None  # lazily built in collision_costs
+        self._target_surface_mask_cache = None  # lazily built in _target_surface_masks
         self._all_pose_ts = None
 
     def _validate_rollout(self, rollout: Rollout):
@@ -487,12 +508,18 @@ class CostFunction:
         # First collate the objects by placement surface.
         surface_to_obj = defaultdict(list)
         surface_to_spheres = defaultdict(list)
+        surface_to_origins = defaultdict(list)
+        surface_to_placements = defaultdict(list)
         for con in self.stable_placement_constraints:
             obj, _, placement, surface = con.params
             pose_ts = rollout["action_to_pose_ts"][placement]
             obj_spheres = obj_to_spheres[obj][:, pose_ts]
             surface_to_obj[surface].append(obj)
             surface_to_spheres[surface].append(obj_spheres)
+            # The object's own origin at the placement, which is what a "support" region is a region
+            # OF -- see the xy branch below.
+            surface_to_origins[surface].append(rollout["obj_to_pose"][obj][:, pose_ts, :3, 3])
+            surface_to_placements[surface].append((obj, placement))
 
         num_particles = rollout["num_particles"]
         support_vals = {}
@@ -519,27 +546,50 @@ class CostFunction:
                 obj_in_goal_xy.scatter_add_(1, sphere_idx_map_expand, in_goal_xy)
                 support_vals[f"{surface}_in_xy"] = obj_in_goal_xy
             else:
-                # Check spheres are within the OBB's xy plane by transforming to OBB local frame
                 obb = self.surface_to_obb[surface]
-
-                # Transform sphere centers to OBB local frame using cached rotation matrix
-                sphere_centers = spheres[..., :3]  # (b, n, 3)
-                centers_relative = sphere_centers - obb.center  # translate to OBB origin
-                centers_local = centers_relative @ obb.rot_matrix_inv.T  # rotate to OBB frame
-
-                # Now everything's in local frame just use AABB check
-                centers_xy = centers_local[..., :2]  # (b, n, 2)
-                # com_xy = centers_xy.mean(1)[:, None]
                 obb_xy_lower = -obb.half_extents[:2]
                 obb_xy_upper = obb.half_extents[:2]
-                in_goal_xy = dist_from_bounds_jit(centers_xy, obb_xy_lower, obb_xy_upper)
 
-                # Accumulate per-object distances
-                obj_in_goal_xy = torch.zeros(
-                    (num_particles, len(objs)), dtype=in_goal_xy.dtype, device=in_goal_xy.device
-                )
-                obj_in_goal_xy.scatter_add_(1, sphere_idx_map_expand, in_goal_xy)
-                support_vals[f"{surface}_in_xy"] = obj_in_goal_xy
+                if self.config.placement_check == "support":
+                    # A support region is the set of valid object ORIGINS: it was fitted for this
+                    # object's footprint, so an origin inside it already means every part of the
+                    # object is over surface that holds it. Charging each collision SPHERE against it
+                    # instead asks the whole object to fit inside a region that is the surface minus
+                    # the object -- unsatisfiable for anything but a point, and the constraint no
+                    # placement could clear.
+                    points = torch.stack(surface_to_origins[surface], dim=1)  # (b, objs, 3)
+                else:
+                    # Check spheres are within the OBB's xy plane by transforming to OBB local frame
+                    points = spheres[..., :3]  # (b, n, 3)
+
+                # Transform to the OBB's local frame using its cached rotation matrix
+                points_local = (points - obb.center) @ obb.rot_matrix_inv.T
+                dist = dist_from_bounds_jit(points_local[..., :2], obb_xy_lower, obb_xy_upper)
+
+                if self.config.placement_check == "support":
+                    support_vals[f"{surface}_in_xy"] = dist  # already (b, objs)
+                    target_yaw = self.surface_to_yaw.get(surface)
+                    if target_yaw is not None:
+                        # The region only holds the object at THIS orientation (see
+                        # cutamp.utils.support.Footprint), and yaw is one of the placement's
+                        # optimized parameters -- without a term here the optimizer is free to turn
+                        # the object out of the pose the region was fitted for. |sin| rather than an
+                        # angle difference because a rectangle is the same either way up: it is zero
+                        # at the pinned yaw AND its half-turn twin, which is exactly the symmetry,
+                        # and reads as radians for the small deviations the tolerance cares about.
+                        rot = torch.stack(
+                            [rollout["obj_to_pose"][obj][:, rollout["action_to_pose_ts"][placement]]
+                             for obj, placement in surface_to_placements[surface]], dim=1
+                        )[..., :3, :3]
+                        yaw = torch.atan2(rot[..., 1, 0], rot[..., 0, 0])  # (b, objs)
+                        support_vals[f"{surface}_yaw"] = torch.abs(torch.sin(yaw - target_yaw))
+                else:
+                    # Accumulate per-object distances
+                    obj_in_goal_xy = torch.zeros(
+                        (num_particles, len(objs)), dtype=dist.dtype, device=dist.device
+                    )
+                    obj_in_goal_xy.scatter_add_(1, sphere_idx_map_expand, dist)
+                    support_vals[f"{surface}_in_xy"] = obj_in_goal_xy
 
             # Distance between bottom of spheres and z-position of the surface
             spheres_bottom = spheres[..., 2] - spheres[..., 3]
@@ -656,6 +706,40 @@ class CostFunction:
         grasp_rot_change = roma.rotmat_geodesic_distance(grasp_rotmat, init_rotmat)  # (b, k)
         return {"grasp_rot_change": grasp_rot_change}
 
+    def _target_surface_masks(self, rollout: Rollout) -> Dict[str, torch.Tensor]:
+        """Per placement surface, an (objs, 1, t) mask of when an object is resting ON it.
+
+        An object resting on a surface is exempt from colliding with THAT surface (see
+        ``TAMPConfiguration.placement_ignores_target_surface``). "Resting on" runs from the object's
+        placement there until its next placement somewhere else, so an object moved plate -> box is
+        exempt from the plate only over the leg where it is on the plate. Cached: the timesteps come
+        from the skeleton, not from the particles.
+        """
+        if self._target_surface_mask_cache is not None:
+            return self._target_surface_mask_cache
+
+        obj_idx = {obj: i for i, obj in enumerate(self._activated_objs)}
+        # obj -> [(timestep, surface)], in execution order
+        placements = defaultdict(list)
+        for con in self.stable_placement_constraints:
+            obj, _, placement, surface = con.params
+            if obj in obj_idx:
+                placements[obj].append((rollout["action_to_pose_ts"][placement], surface))
+
+        num_t = rollout["robot_spheres"].shape[1]
+        masks: Dict[str, torch.Tensor] = {}
+        for obj, entries in placements.items():
+            entries.sort()
+            for i, (ts, surface) in enumerate(entries):
+                end = entries[i + 1][0] if i + 1 < len(entries) else num_t
+                if surface not in masks:
+                    masks[surface] = torch.zeros(
+                        (len(self._activated_objs), 1, num_t), dtype=torch.bool, device=self.world.device
+                    )
+                masks[surface][obj_idx[obj], :, ts:end] = True
+        self._target_surface_mask_cache = masks
+        return masks
+
     def collision_costs(self, rollout: Rollout, obj_to_spheres: Dict[str, Float[torch.Tensor, "b t n 4"]]) -> dict:
         """Collision costs."""
         # Robot to world
@@ -672,8 +756,25 @@ class CostFunction:
         # spheres cause an invalid start state during retract planning.
         with torch.profiler.record_function("coll::movable_to_world"):
             stacked = torch.stack([obj_to_spheres[obj] for obj in self._activated_objs])
-            coll = self.world.collision_fn(rearrange(stacked, "objs b t n d -> (objs b) t n d"))
-            coll = rearrange(coll, "(objs b) t -> objs b t", objs=len(self._activated_objs))
+            flat = rearrange(stacked, "objs b t n d -> (objs b) t n d")
+            num_objs = len(self._activated_objs)
+            coll = self.world.collision_fn(flat)
+            coll = rearrange(coll, "(objs b) t -> objs b t", objs=num_objs)
+
+            # Let each placed object overlap the surface it was placed ON, from that placement
+            # onwards. An open container reconstructs as its convex hull, so the inside of a box and
+            # the dish of a plate read as solid and NO placement there can satisfy this constraint --
+            # which is why placements used to end up on top of the hull, at the height of a box's
+            # lid. One extra collision call per placement surface (a plan has one or two), each
+            # differing from the full checker by exactly that one obstacle; every other obstacle, and
+            # this object before it is placed, is still screened by `coll` above.
+            if self.config.placement_ignores_target_surface:
+                for surface, mask in self._target_surface_masks(rollout).items():
+                    exempt_fn = self.world.collision_fn_for_placement(exclude=surface)
+                    coll_exempt = rearrange(
+                        exempt_fn(flat), "(objs b) t -> objs b t", objs=num_objs
+                    )
+                    coll = torch.where(mask, coll_exempt, coll)
             if self.config.mask_initial_movable_world_collision:
                 if self._movable_world_mask is None:
                     num_objs, t = coll.shape[0], coll.shape[2]

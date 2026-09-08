@@ -11,7 +11,7 @@
 
 import contextlib
 import logging
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -71,6 +71,7 @@ def _plan_transit(
     world: TAMPWorld,
     apex_height: float,
     apex_min_dist: float,
+    hidden_at_goal: Sequence[str] = (),
 ):
     """Plan one free-space transit leg, optionally arcing over an explicit APEX waypoint.
 
@@ -93,6 +94,13 @@ def _plan_transit(
     Any apex failure falls back to the direct plan rather than failing the transit: the apex is a
     preference about path shape, not a constraint, and an apex that happens to be unreachable (near a
     joint limit, under a ceiling, inside an obstacle) must not cost us a plan we would otherwise find.
+
+    ``hidden_at_goal`` names obstacles to hide on the legs that ARRIVE at the goal -- the descent
+    from the apex, and the direct plan -- while the traverse to the apex keeps them. That is for a
+    goal INSIDE one of them: a container reconstructs as a filled solid, so a pre-place pose down in
+    its cavity has no collision-free IK while it is enabled, and cuRobo answers IK_FAIL however many
+    approach offsets are tried. Scoped to the arriving leg so the long traverse still routes around
+    the container instead of through it.
     """
     goal_pose = Pose.from_matrix(world_from_goal)
     if apex_height > 0.0:
@@ -110,7 +118,8 @@ def _plan_transit(
             apex_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_apex), plan_config)
             if apex_result.success:
                 apex_js = JointState.from_position(apex_result.get_interpolated_plan().position[-1:])
-                descend_result = motion_gen.plan_single(apex_js, goal_pose, plan_config)
+                with _obstacles_hidden(motion_gen, hidden_at_goal):
+                    descend_result = motion_gen.plan_single(apex_js, goal_pose, plan_config)
                 if descend_result.success:
                     _log.debug(f"Transit planned via apex {apex_height}m above the straight line")
                     return [apex_result, descend_result], descend_result
@@ -118,8 +127,43 @@ def _plan_transit(
             else:
                 _log.debug(f"Start -> apex leg failed ({apex_result.status}); falling back to direct")
 
-    direct_result = motion_gen.plan_single(start_js, goal_pose, plan_config)
+    with _obstacles_hidden(motion_gen, hidden_at_goal):
+        direct_result = motion_gen.plan_single(start_js, goal_pose, plan_config)
     return ([direct_result] if direct_result.success else None), direct_result
+
+
+def _plan_retract_out_of(motion_gen, start_js: JointState, world_from_retracts, plan_config, hidden):
+    """Lift the gripper out of a container it was left inside. -> (result or None, last status).
+
+    A plan that ends by placing INTO a container leaves the gripper down inside that container's
+    filled convex hull, so this lift STARTS in world collision and cuRobo refuses it outright with
+    INVALID_START_STATE_WORLD_COLLISION -- identically for every particle, since they all end in the
+    same place. The container is hidden for the lift itself.
+
+    Hiding it is not enough on its own. Whatever runs next -- the go-home leg, another cuTAMP goal,
+    a person on the teleop rig -- starts from where this lift ends and sees the container again, so
+    the lift has to actually leave the hull, and a 5 cm lift out of a tray under a 22 cm lid does
+    not. Hence the ladder, and hence the test that decides it: the configuration the lift ends at
+    has to be a legal START with the container back on. Longest lift that planned is the fallback
+    when none of them clears, which is still better than the shortest.
+    """
+    best = None
+    status = None
+    for world_from_retract in world_from_retracts:
+        with _obstacles_hidden(motion_gen, hidden):
+            candidate = motion_gen.plan_single(
+                start_js, Pose.from_matrix(world_from_retract), plan_config
+            )
+        status = candidate.status
+        if not candidate.success:
+            continue
+        best = candidate
+        lifted = JointState.from_position(candidate.get_interpolated_plan().position[-1:])
+        if motion_gen.check_start_state(lifted)[0]:
+            return best, status
+    if best is not None:
+        _log.debug(f"Retract never fully cleared {hidden}; using the longest lift that planned")
+    return best, status
 
 
 def solve_curobo(
@@ -173,6 +217,9 @@ def solve_curobo(
 
     last_js = JointState.from_position(best_particle["q0"][None].clone())
     last_q_name = "q0"
+    # Container the last operator left the gripper INSIDE, for the closing retract below. Only a
+    # Place-into ever sets it; every other operator ends the gripper in free space.
+    ended_inside: tuple[str, ...] = ()
 
     # Fixed approach offset. This could be something we eventually optimize too
     approach_offset = torch.eye(4, device=world.device)
@@ -214,6 +261,7 @@ def solve_curobo(
 
         # Pick
         elif op_name == Pick.name:
+            ended_inside = ()
             obj, grasp, q = ground_op.values
             assert last_js is not None
 
@@ -357,6 +405,19 @@ def solve_curobo(
             obj, grasp, placement, surface, q = ground_op.values
             assert last_js is not None
 
+            # Placing INTO the target container, rather than on top of it (see
+            # TAMPConfiguration.placement_ignores_target_surface). The pre-place pose and the final
+            # pose are both down inside its filled convex hull, so cuRobo has no collision-free IK
+            # for either while it is enabled -- IK_FAIL on every particle, whatever the support
+            # region said. Hidden for the legs that arrive there and nowhere else: only this one
+            # surface, only at the destination, and only when the placement cost has already been
+            # told the object is allowed to overlap it.
+            into_target = (
+                (surface,)
+                if config.placement_ignores_target_surface and surface in world.pick_transparent
+                else ()
+            )
+
             with timer.time(f"{timeline}_planning"):
                 start_js = last_js
 
@@ -416,6 +477,7 @@ def solve_curobo(
                         app_results, app_result = _plan_transit(
                             motion_gen, retract_js, world_from_approach, plan_config, world,
                             config.transit_apex_height, config.transit_apex_min_dist,
+                            hidden_at_goal=into_target,
                         )
                         _log.debug(
                             f"Retract attempt {ret_idx + 1}/{len(approach_offsets)}, approach attempt "
@@ -443,13 +505,16 @@ def solve_curobo(
 
                 # Plan from approach to end js
                 approach_js = JointState.from_position(approach_results[-1].get_interpolated_plan().position[-1:])
-                end_result = motion_gen.plan_single(
-                    approach_js, Pose.from_matrix(world_from_ee), constrained_plan_config
-                )
+                with _obstacles_hidden(motion_gen, into_target):
+                    end_result = motion_gen.plan_single(
+                        approach_js, Pose.from_matrix(world_from_ee), constrained_plan_config
+                    )
                 if not end_result.success:
                     raise MotionPlanningError(
                         f"Failed to plan from approach to end for {ground_op.name}. Status: {end_result.status}"
                     )
+
+            ended_inside = into_target
 
             # Compute the offset between the object and end-effector at start of plan
             obj_from_ee = torch.inverse(obj_to_current_pose[obj]) @ world_from_ee_start
@@ -539,10 +604,21 @@ def solve_curobo(
 
     # Plan to retract
     world_from_ee = world.kin_model.get_state(start_js.position).ee_pose.get_matrix()[0]
-    world_from_retract = world_from_ee @ approach_offset
-    retract_result = motion_gen.plan_single(start_js, Pose.from_matrix(world_from_retract), constrained_plan_config)
-    if not retract_result.success:
-        raise MotionPlanningError(f"Failed to plan for retract. Status: {retract_result.status}")
+    if ended_inside:
+        retract_result, retract_status = _plan_retract_out_of(
+            motion_gen, start_js, world_from_ee @ approach_offsets, constrained_plan_config, ended_inside
+        )
+        if retract_result is None:
+            raise MotionPlanningError(
+                f"Failed to plan for retract out of {', '.join(ended_inside)}. Status: {retract_status}"
+            )
+    else:
+        world_from_retract = world_from_ee @ approach_offset
+        retract_result = motion_gen.plan_single(
+            start_js, Pose.from_matrix(world_from_retract), constrained_plan_config
+        )
+        if not retract_result.success:
+            raise MotionPlanningError(f"Failed to plan for retract. Status: {retract_result.status}")
     dt = retract_result.interpolation_dt
     plan = retract_result.get_interpolated_plan()
     accum_plans.append(

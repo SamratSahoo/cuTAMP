@@ -75,10 +75,39 @@ class TAMPConfiguration:
     stick_button_experiment: bool = False
 
     ## Experimental Stuff
-    # Whether to check placements using AABB or OBB formulation
-    placement_check: Literal["aabb", "obb"] = "aabb"
+    # How the region an object may be placed on is derived from the surface.
+    #   aabb    -- axis-aligned bounding box of the surface, object bottom at its top face
+    #   obb     -- minimum-area oriented box, object bottom at the surface's highest vertex
+    #   support -- the largest LEVEL, OBSERVED patch of the surface that the object's footprint fits
+    #              inside with margin, object bottom at that patch's own height. Needs the surface's
+    #              raw point cloud (TAMPEnvironment.support_points); see cutamp/utils/support.py for
+    #              why the bounding box is the wrong region for anything that is not a slab.
+    placement_check: Literal["aabb", "obb", "support"] = "aabb"
     # Distance to shrink the placement region check on all sides, only supported for OBB right now
     placement_shrink_dist: Optional[float] = None
+    # placement_check="support" knobs -- see cutamp.utils.support.SupportConfig for what each does.
+    support_resolution: float = 0.005
+    support_flatness_tol: float = 0.008
+    support_margin: float = 0.005
+    # Treat the unobserved cells enclosed by a surface's outline as floor, so an object can be placed
+    # in a container whose interior the camera could not see into. Off by default: it is the one knob
+    # here that places onto surface that was never observed. See cutamp.utils.support._fill_occluded.
+    support_fill_occluded: bool = False
+    # With support_fill_occluded, the fraction of a footprint that must be genuinely observed.
+    support_min_seen_frac: float = 0.25
+    # What to do when no level patch of a surface is big enough for the object. True (the default)
+    # rejects the placement, so the plan fails with a reason instead of releasing the object over
+    # whatever the bounding box happened to span. False falls back to the OBB region and logs.
+    placement_support_required: bool = True
+    # Let a PLACED object overlap the surface it was placed on in the movable-to-world collision
+    # cost, from that placement onwards. Perception reconstructs an open container as its convex
+    # hull -- a filled solid -- so the inside of a box, and the dish of a plate, are "in collision"
+    # with the container itself and no placement there can ever satisfy the constraint. Only the
+    # object's own target surface is exempted, and only from its placement on; every other obstacle,
+    # and the same object before it is placed, keeps the full checker. Placing INTO a container
+    # needs this; it is only sound alongside placement_check="support", which is what then keeps the
+    # object on real geometry rather than inside it.
+    placement_ignores_target_surface: bool = False
 
     ## Soft Costs
     optimize_soft_costs: bool = False
@@ -330,6 +359,26 @@ def validate_tamp_config(config: TAMPConfiguration):
 
     # Placement region checks
     if config.placement_check != "obb" and config.placement_shrink_dist is not None:
+        # "support" has its own clearance knob (support_margin), applied against the object's actual
+        # footprint rather than as a blanket inset, so accepting both would shrink twice.
         raise NotImplementedError(
             f"placement_shrink_dist only supported with placement_check = obb, not {config.placement_check}"
+            + (" -- use support_margin instead" if config.placement_check == "support" else "")
+        )
+    if config.support_resolution <= 0.0:
+        raise ValueError(f"support_resolution must be positive, not {config.support_resolution}")
+    if config.support_flatness_tol <= 0.0:
+        raise ValueError(f"support_flatness_tol must be positive, not {config.support_flatness_tol}")
+    if config.support_margin < 0.0:
+        raise ValueError(f"support_margin must be non-negative, not {config.support_margin}")
+    if not 0.0 <= config.support_min_seen_frac <= 1.0:
+        raise ValueError(
+            f"support_min_seen_frac must be in [0, 1], not {config.support_min_seen_frac}"
+        )
+    if config.placement_ignores_target_surface and config.placement_check != "support":
+        # Without the support region there is nothing keeping the object ON the surface once the
+        # surface stops rejecting it -- the bounding-box region would happily drop it through.
+        raise ValueError(
+            "placement_ignores_target_surface requires placement_check = support, not "
+            f"{config.placement_check}"
         )

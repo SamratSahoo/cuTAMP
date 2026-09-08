@@ -7,7 +7,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import torch
 from curobo.geom.types import Obstacle, Cuboid, Mesh
@@ -15,7 +15,13 @@ from jaxtyping import Float
 
 from cutamp.utils.common import approximate_goal_aabb, pose_list_to_mat4x4, transform_points
 from cutamp.utils.obb import get_object_obb
+
+if TYPE_CHECKING:
+    from cutamp.utils.obb import OrientedBoundingBox
 from cutamp.utils.shapes import MultiSphere
+
+#: Spread of the placement yaws sampled around a pinned orientation, in radians (~1.7 degrees).
+_YAW_PIN_JITTER = 0.03
 
 Grasp4DOF = Place4DOF = Float[torch.Tensor, "n 4"]
 Grasp6DOF = Place6DOF = Float[torch.Tensor, "n 6"]
@@ -138,10 +144,26 @@ def place_4dof_sampler(
     surface_rep: str,
     shrink_dist: float | None,
     collision_activation_dist: float,
+    obb: Optional["OrientedBoundingBox"] = None,
+    object_yaw: Optional[float] = None,
 ) -> Place4DOF:
-    """Sample 4-DOF placement poses in the world frame. This does not yet fully support surfaces with yaw."""
+    """Sample 4-DOF placement poses in the world frame. This does not yet fully support surfaces with yaw.
+
+    ``obb`` is the placement region to sample inside, from ``TAMPWorld.placement_obb`` -- passed in
+    rather than refitted here so the sampler and the stable-placement cost cannot disagree about
+    where the surface is. Required for ``surface_rep="support"``, where the region is a fitted patch
+    of the surface and not something this function could derive from the obstacle alone.
+
+    ``object_yaw`` pins the placement's orientation. A support region is normally fitted to the
+    object's bounding disc and holds it at any yaw, in which case this is None and yaw is sampled
+    freely as before. It is set only where the object fits the surface at ONE orientation -- a loaf
+    lying along a narrow tray -- and the region is then valid for that yaw alone, so sampling
+    uniformly would start almost every particle in a placement the region does not justify.
+    """
     if not isinstance(surface, (Cuboid, Mesh)):
         raise NotImplementedError(f"Only Cuboid or Mesh surfaces supported for now, not {type(surface)}")
+    if surface_rep == "support" and obb is None:
+        raise ValueError("surface_rep='support' needs the fitted region -- pass obb")
 
     device = obj.tensor_args.device
 
@@ -156,19 +178,25 @@ def place_4dof_sampler(
     z_offset = z_lower + (z_upper - z_lower) * z_offset
 
     # Sample xyz based on surface representation in the world frame
-    if surface_rep == "obb":
-        obb = get_object_obb(surface, shrink_dist)
+    if surface_rep in ("obb", "support"):
+        if obb is None:
+            obb = get_object_obb(surface, shrink_dist)
 
         # Compute maximum radial extent of object spheres (in object frame)
         # Since yaw is sampled, the object can be rotated - use radial distance for safety
         radial_distances = torch.sqrt(obj_spheres[:, 0] ** 2 + obj_spheres[:, 1] ** 2) + obj_spheres[:, 3]
         max_xy_extent = radial_distances.max()
 
-        # Shrink OBB bounds to ensure object spheres stay within surface OBB
-        # If object is too large, clamp to prevent negative bounds and use full OBB
-        sampling_half_extents = (obb.half_extents[:2] - max_xy_extent).clamp(min=0.0)
-        if (sampling_half_extents == 0.0).any():
+        if surface_rep == "support":
+            # Already a region of valid object CENTRES -- fitted for THIS object's footprint plus a
+            # margin (see cutamp.utils.support). Shrinking again would inset it by the radius twice.
             sampling_half_extents = obb.half_extents[:2]
+        else:
+            # Shrink OBB bounds to ensure object spheres stay within surface OBB
+            # If object is too large, clamp to prevent negative bounds and use full OBB
+            sampling_half_extents = (obb.half_extents[:2] - max_xy_extent).clamp(min=0.0)
+            if (sampling_half_extents == 0.0).any():
+                sampling_half_extents = obb.half_extents[:2]
 
         # Sample in OBB's local (axis-aligned) frame
         xy_local = torch.rand(num_samples, 2, device=device) * 2 - 1  # [-1, 1]
@@ -217,6 +245,15 @@ def place_4dof_sampler(
         raise ValueError(f"Unsupported combination: surface_rep={surface_rep}, surface type={type(surface)}")
 
     # Sample yaw and create final 4-DOF placement (xyz in world frame + yaw)
-    yaw = sample_yaw(num_samples, None, device)
+    if object_yaw is None:
+        yaw = sample_yaw(num_samples, None, device)
+    else:
+        # The pinned orientation and its half-turn twin -- a rectangle covers the same ground either
+        # way, and offering both leaves the reach and collision checks a choice. The jitter keeps the
+        # particles from starting as one identical pose, and is far inside the placement cost's yaw
+        # tolerance so none of them starts out violating it.
+        flip = torch.randint(0, 2, (num_samples,), device=device) * torch.pi
+        jitter = (torch.rand(num_samples, device=device) * 2 - 1) * _YAW_PIN_JITTER
+        yaw = object_yaw + flip + jitter
     place_4dof = torch.cat([xyz_world, yaw.unsqueeze(-1)], dim=1)
     return place_4dof

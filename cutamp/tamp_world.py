@@ -10,8 +10,9 @@ import itertools
 import logging
 import warnings
 from functools import cached_property
-from typing import List, Literal, Dict, Union, Optional
+from typing import TYPE_CHECKING, List, Literal, Dict, Union, Optional
 
+import numpy as np
 import torch
 from jaxtyping import Float
 
@@ -32,7 +33,12 @@ from cutamp.task_planning import State
 from cutamp.utils.collision import get_world_collision_cost
 from cutamp.utils.common import approximate_goal_aabb, transform_spheres
 from cutamp.utils.common import sample_between_bounds, get_world_cfg, pose_list_to_mat4x4
+from cutamp.utils.obb import OrientedBoundingBox, get_object_obb
+from cutamp.utils.support import Footprint, NoSupportRegion, SupportConfig, fit_support_region
 from cutamp.utils.shapes import sample_greedy_surface_spheres
+
+if TYPE_CHECKING:
+    from cutamp.config import TAMPConfiguration
 
 _log = logging.getLogger(__name__)
 
@@ -56,6 +62,10 @@ class TAMPWorld:
     ):
         self.env = env
         self.tensor_args = tensor_args
+        # Raw observed points per surface, for the "support" placement region (see placement_obb).
+        self.support_points = dict(getattr(env, "support_points", {}) or {})
+        self._placement_obbs: Dict[tuple, tuple] = {}
+        self._collision_fns_excluding: Dict[str, object] = {}
 
         # Dicts and sets for indexing
         self._movable_names = {obj.name for obj in env.movables}
@@ -248,6 +258,106 @@ class TAMPWorld:
         """Get the collision spheres for the object (by either name or the cuRobo Obstacle)."""
         obj_name = obj.name if isinstance(obj, Obstacle) else obj
         return self._obj_to_spheres[obj_name]
+
+    def placement_obb(
+        self, surface: str, footprint: "Footprint", config: "TAMPConfiguration"
+    ) -> tuple[OrientedBoundingBox, Optional[float]]:
+        """The region an object of this ``footprint`` may be placed on ``surface``, and its yaw.
+
+        The yaw is None when the placement may be made at any orientation -- the normal case. It is
+        set when the object only fits the surface at a committed orientation, and both the sampler
+        and the placement cost then have to pin the placement's yaw to it (see cutamp.utils.support).
+
+        One place, so the sampler that draws placements and the cost that scores them cannot
+        disagree about where the surface is -- they did when each called ``get_object_obb`` itself.
+        Cached per (surface, rounded footprint); the half extents are quantised to a millimetre so two
+        objects of near-identical size share one fit.
+
+        For ``placement_check="support"`` this is the largest level patch of the surface's observed
+        point cloud that the footprint fits inside, at that patch's own height (see
+        cutamp.utils.support). Falls back to the surface's oriented bounding box when the surface has
+        no point cloud -- the table, and anything from a hand-built environment, are genuinely slabs
+        and the box is right for them.
+
+        Raises:
+            NoSupportRegion: when the surface HAS a point cloud but no level patch of it is big
+                enough, and ``config.placement_support_required``.
+        """
+        key = (surface, *(round(v, 3) for v in
+                          (footprint.min_x, footprint.max_x, footprint.min_y, footprint.max_y)))
+        if key in self._placement_obbs:
+            return self._placement_obbs[key]
+
+        surface_obj = self.get_object(surface)
+        obb, object_yaw = None, None
+        if config.placement_check == "support":
+            points = self.support_points.get(surface)
+            if points is None:
+                _log.info(
+                    f"Surface '{surface}' has no point cloud; using its bounding box as the "
+                    "placement region"
+                )
+            else:
+                region = fit_support_region(
+                    points,
+                    footprint,
+                    SupportConfig(
+                        resolution=config.support_resolution,
+                        flatness_tol=config.support_flatness_tol,
+                        margin=config.support_margin,
+                        fill_occluded=config.support_fill_occluded,
+                        min_seen_frac=config.support_min_seen_frac,
+                    ),
+                )
+                if region is None:
+                    msg = (
+                        f"No level patch of '{surface}' is large enough to support an object of "
+                        f"footprint {(footprint.max_x - footprint.min_x) * 100:.1f} x "
+                        f"{(footprint.max_y - footprint.min_y) * 100:.1f} cm (swept disc "
+                        f"{footprint.radius * 200:.1f} cm across) with "
+                        f"{config.support_margin * 100:.1f} cm margin"
+                    )
+                    if config.placement_support_required:
+                        raise NoSupportRegion(msg)
+                    _log.warning(f"{msg}; falling back to the bounding box placement region")
+                else:
+                    _log.info(
+                        f"Support region for '{surface}': "
+                        f"{region.half_extents[0] * 200:.1f}x{region.half_extents[1] * 200:.1f} cm at "
+                        f"z={region.surface_z:.3f} ({region.observed_frac:.0%} of the footprint "
+                        f"genuinely observed{'' if region.object_yaw is None else f', at a pinned yaw of {np.degrees(region.object_yaw) % 180:.0f} deg'}), "
+                        f"against a bounding box top at z={get_object_obb(surface_obj).surface_z:.3f}"
+                    )
+                    obb, object_yaw = region.to_obb(self.tensor_args), region.object_yaw
+
+        if obb is None:
+            # support_margin stands in for placement_shrink_dist on this path, which the "support"
+            # configuration leaves unset -- otherwise the table, the one surface that never has a
+            # point cloud, would be the only surface placements could run right up to the edge of.
+            shrink = config.placement_shrink_dist
+            if shrink is None and config.placement_check == "support":
+                shrink = config.support_margin
+            obb = get_object_obb(surface_obj, shrink_dist=shrink)
+        self._placement_obbs[key] = (obb, object_yaw)
+        return self._placement_obbs[key]
+
+    def collision_fn_for_placement(self, exclude: Optional[str] = None):
+        """``collision_fn``, optionally with one obstacle dropped.
+
+        ``exclude`` is the surface an object is being placed ON. Perception reconstructs an open
+        container as its convex hull, so the inside of a box and the dish of a plate are both solid
+        to the checker and every placement there scores as a collision -- see
+        ``TAMPConfiguration.placement_ignores_target_surface``. Cached per name; there are as many
+        of these as there are placement surfaces in a plan, which is one or two.
+        """
+        if exclude is None:
+            return self.collision_fn
+        if exclude not in self._collision_fns_excluding:
+            cfg = get_world_cfg(self.env, include_movables=False, exclude={exclude})
+            self._collision_fns_excluding[exclude] = get_world_collision_cost(
+                cfg, self.tensor_args, self.collision_activation_distance
+            )
+        return self._collision_fns_excluding[exclude]
 
     def get_aabb(self, obj: Union[Obstacle, str]) -> Float[torch.Tensor, "2 3"]:
         """Get AABB for the given object."""

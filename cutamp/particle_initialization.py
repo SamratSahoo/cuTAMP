@@ -52,6 +52,7 @@ from cutamp.utils.common import (
     transform_spheres,
 )
 from cutamp.utils.shapes import MultiSphere
+from cutamp.utils.support import footprint_from_object
 
 _log = logging.getLogger(__name__)
 
@@ -70,6 +71,33 @@ class NoGraspsError(RuntimeError):
 # --------------------------------------------------------------------------------------------- #
 _posture_warned = False
 _ROLL_CACHE: dict = {}
+
+
+def _placement_obb(world: TAMPWorld, config: TAMPConfiguration, surface: str, obj, obj_spheres):
+    """The region to sample this object's placements on ``surface``, and the yaw it needs.
+
+    Thin wrapper so all three Place operators reach the same cached fit in ``TAMPWorld`` that the
+    stable-placement cost uses -- a sampler drawing from one region while the cost scores against
+    another is how placements end up outside the region they were checked in. ``(None, None)`` on
+    the AABB path, which derives its bounds inside the sampler.
+    """
+    if config.placement_check == "aabb":
+        return None, None
+    return world.placement_obb(
+        surface, footprint_from_object(world.get_object(obj), obj_spheres), config
+    )
+
+
+def _placement_collision_fn(world: TAMPWorld, config: TAMPConfiguration, surface: str):
+    """Collision checker for ranking candidate placements, minus the surface being placed on.
+
+    See ``TAMPConfiguration.placement_ignores_target_surface``: with the container left in, every
+    candidate inside it collides with the container's own filled hull, so the ranking has nothing
+    left to sort by and picks arbitrarily among them.
+    """
+    if not config.placement_ignores_target_surface:
+        return world.collision_fn
+    return world.collision_fn_for_placement(exclude=surface)
 
 
 def parallel_jaw_roll(device, dtype):
@@ -623,6 +651,7 @@ class ParticleInitializer:
                     sampled_placements = torch.cat([xyz, yaw.unsqueeze(-1)], dim=1)
                 else:
                     surface_curobo = world.get_object(surface)
+                    place_obb, place_yaw = _placement_obb(world, config, surface, obj, obj_spheres)
                     sampled_placements = place_4dof_sampler(
                         num_particles * 2,
                         obj_curobo,
@@ -631,12 +660,19 @@ class ParticleInitializer:
                         surface_rep=self.config.placement_check,
                         shrink_dist=self.config.placement_shrink_dist,
                         collision_activation_dist=self.config.world_activation_distance,
+                        obb=place_obb,
+                        object_yaw=place_yaw,
                     )
 
-                # Select the placements that are not in collision with the object
+                # Select the placements that are not in collision with the object. The target
+                # surface is dropped from the checker when placements are allowed INTO it, so that
+                # candidates inside a container are not all ranked equally terrible against the
+                # container's own filled hull (see placement_ignores_target_surface).
                 world_from_obj = action_4dof_to_mat4x4(sampled_placements)  # desired placement pose
                 obj_place_spheres = transform_spheres(obj_spheres, world_from_obj)
-                place_coll = world.collision_fn(obj_place_spheres[:, None].contiguous())[:, 0]
+                place_coll = _placement_collision_fn(world, config, surface)(
+                    obj_place_spheres[:, None].contiguous()
+                )[:, 0]
                 best_idxs = place_coll.topk(num_particles, largest=False).indices
                 sampled_placements = sampled_placements[best_idxs]
                 world_from_obj = world_from_obj[best_idxs]
@@ -928,6 +964,7 @@ class ParticleInitializer:
                         raise ValueError(f"{surface=} not found in world")
 
                     obj_spheres = world.get_collision_spheres(obj)
+                    place_obb, place_yaw = _placement_obb(world, config, surface, obj, obj_spheres)
                     sampled_placements = place_4dof_sampler(
                         num_particles * 2,
                         world.get_object(obj),
@@ -936,9 +973,11 @@ class ParticleInitializer:
                         surface_rep=config.placement_check,
                         shrink_dist=config.placement_shrink_dist,
                         collision_activation_dist=config.world_activation_distance,
+                        obb=place_obb,
+                        object_yaw=place_yaw,
                     )
                     world_from_obj = action_4dof_to_mat4x4(sampled_placements)
-                    place_coll = world.collision_fn(
+                    place_coll = _placement_collision_fn(world, config, surface)(
                         transform_spheres(obj_spheres, world_from_obj)[:, None].contiguous()
                     )[:, 0]
                     best = place_coll.topk(num_particles, largest=False).indices
@@ -1055,13 +1094,16 @@ class ParticleInitializer:
                     raise ValueError(f"{surface=} not found in world")
                 taker = world.arms[1]
                 obj_spheres = world.get_collision_spheres(obj)
+                place_obb, place_yaw = _placement_obb(world, config, surface, obj, obj_spheres)
                 sampled = place_4dof_sampler(
                     num_particles * 2, world.get_object(obj), obj_spheres, world.get_object(surface),
                     surface_rep=config.placement_check, shrink_dist=config.placement_shrink_dist,
                     collision_activation_dist=config.world_activation_distance,
+                    obb=place_obb,
+                    object_yaw=place_yaw,
                 )
                 world_from_obj = action_4dof_to_mat4x4(sampled)
-                coll = world.collision_fn(
+                coll = _placement_collision_fn(world, config, surface)(
                     transform_spheres(obj_spheres, world_from_obj)[:, None].contiguous()
                 )[:, 0]
                 best = coll.topk(num_particles, largest=False).indices

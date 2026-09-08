@@ -9,8 +9,9 @@
 
 import os
 import warnings
-from typing import Dict, List, ClassVar, Sequence, Set, Tuple
+from typing import Dict, List, ClassVar, Optional, Sequence, Set, Tuple
 
+import numpy as np
 import torch
 import yaml
 from curobo.geom.types import Cuboid, Obstacle, Cylinder, Mesh
@@ -34,6 +35,7 @@ class TAMPEnvironment:
         type_to_objects: Dict[str, List[Obstacle]],
         goal_state: State,
         pick_transparent: Sequence[str] = (),
+        support_points: Optional[Dict[str, "np.ndarray"]] = None,
     ):
         self.name = name
         self.movables = movables
@@ -43,6 +45,11 @@ class TAMPEnvironment:
         # Statics the arm is allowed to reach INTO -- open containers that perception
         # reconstructs as filled solids. See TAMPWorld.pick_transparent.
         self.pick_transparent = tuple(pick_transparent)
+        # Raw observed points per surface name, (N, 3) in the world frame, for
+        # placement_check="support". These must be the OBSERVATIONS: the convex hull an obstacle
+        # carries has no concavity left in it, so a box's floor and a plate's dish are both gone
+        # from it. A surface with no entry here falls back to the bounding-box placement region.
+        self.support_points = dict(support_points or {})
 
         # No object (identified by name) should be in both movables and statics
         movable_names = {obj.name for obj in movables}
