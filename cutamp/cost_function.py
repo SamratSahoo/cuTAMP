@@ -714,19 +714,31 @@ class CostFunction:
         placement there until its next placement somewhere else, so an object moved plate -> box is
         exempt from the plate only over the leg where it is on the plate. Cached: the timesteps come
         from the skeleton, not from the particles.
+
+        The mask is on the OBJECT-POSE timeline -- ``rollout["obj_to_pose"]``, one entry per Place
+        plus the initial pose -- because that is what ``obj_to_spheres`` and therefore the collision
+        values it selects are indexed by. Not the robot timeline (``robot_spheres``), which has an
+        entry per Pick AND per Place: the two are the same length only for a single-placement
+        skeleton, so sizing this from the robot's worked for one pick-and-place and mismatched 4
+        against 3 on the first plan that placed twice.
         """
         if self._target_surface_mask_cache is not None:
             return self._target_surface_mask_cache
 
         obj_idx = {obj: i for i, obj in enumerate(self._activated_objs)}
-        # obj -> [(timestep, surface)], in execution order
+        # obj -> [(pose timestep, surface)], in execution order
         placements = defaultdict(list)
         for con in self.stable_placement_constraints:
             obj, _, placement, surface = con.params
             if obj in obj_idx:
                 placements[obj].append((rollout["action_to_pose_ts"][placement], surface))
 
-        num_t = rollout["robot_spheres"].shape[1]
+        if not placements:
+            self._target_surface_mask_cache = {}
+            return self._target_surface_mask_cache
+
+        # Every movable's pose list is accumulated in lockstep, so any one of them gives the length.
+        num_t = next(iter(rollout["obj_to_pose"].values())).shape[1]
         masks: Dict[str, torch.Tensor] = {}
         for obj, entries in placements.items():
             entries.sort()

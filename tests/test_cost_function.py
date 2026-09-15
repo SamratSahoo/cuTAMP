@@ -239,3 +239,77 @@ def test_an_unpinned_region_emits_no_yaw_term():
     values = _placement_values(TAMPConfiguration(placement_check="support"), _region(), (0.0, 0.0))
     assert "table_yaw" not in values
     assert "table_in_xy" in values
+
+
+class _FakeSurfacePlacement:
+    """Stand-in for a StablePlacement constraint with a per-placement parameter name."""
+
+    def __init__(self, obj: str, placement: str, surface: str):
+        self.params = (obj, "grasp1", placement, surface)
+
+
+def _target_mask_host(placements, activated, device="cpu"):
+    """A CostFunction with just the attributes _target_surface_masks reads, on CPU."""
+    from cutamp.cost_function import CostFunction
+
+    host = object.__new__(CostFunction)
+    host.world = _FakeWorld(torch.device(device))
+    host.stable_placement_constraints = [_FakeSurfacePlacement(*p) for p in placements]
+    host._activated_objs = list(activated)
+    host._target_surface_mask_cache = None
+    return host
+
+
+def _target_mask_rollout(action_to_pose_ts, num_pose_ts, num_robot_ts, objs):
+    """A rollout with the two timelines DIFFERENT lengths, which is the normal case.
+
+    ``obj_to_pose`` carries one entry per Place plus the initial pose; ``robot_spheres`` carries one
+    per Pick and one per Place. Only the object-pose timeline may size the mask.
+    """
+    return {
+        "action_to_pose_ts": dict(action_to_pose_ts),
+        "obj_to_pose": {obj: torch.eye(4).repeat(2, num_pose_ts, 1, 1) for obj in objs},
+        "robot_spheres": torch.zeros(2, num_robot_ts, 5, 4),
+    }
+
+
+def test_target_surface_mask_is_on_the_object_pose_timeline():
+    """Two placements: 3 object-pose timesteps against 4 robot timesteps.
+
+    Sized from robot_spheres this came out length 4 and broke the torch.where in collision_costs
+    against a (objs, b, 3) collision tensor -- "size of tensor a (4) must match tensor b (3)".
+    """
+    host = _target_mask_host(
+        [("block", "pose1", "table"), ("block", "pose2", "cloth")], ["block"]
+    )
+    rollout = _target_mask_rollout(
+        {"pose1": 1, "pose2": 2}, num_pose_ts=3, num_robot_ts=4, objs=["block"]
+    )
+    masks = host._target_surface_masks(rollout)
+
+    assert set(masks) == {"table", "cloth"}
+    for surface, mask in masks.items():
+        assert mask.shape == (1, 1, 3), f"{surface} sized off the wrong timeline"
+    # On the table from its placement until it is picked back up for the second placement...
+    assert masks["table"][0, 0].tolist() == [False, True, False]
+    # ...and on the cloth from the second placement to the end.
+    assert masks["cloth"][0, 0].tolist() == [False, False, True]
+
+
+def test_target_surface_mask_broadcasts_against_the_collision_tensor():
+    """The shape contract collision_costs relies on: torch.where(mask, coll_exempt, coll)."""
+    host = _target_mask_host([("block", "pose1", "table")], ["block", "other"])
+    rollout = _target_mask_rollout(
+        {"pose1": 1}, num_pose_ts=2, num_robot_ts=2, objs=["block", "other"]
+    )
+    mask = host._target_surface_masks(rollout)["table"]
+    coll = torch.zeros(2, 7, 2)  # (objs, batch, pose timesteps)
+    assert torch.where(mask, coll + 1.0, coll).shape == coll.shape
+    # Only the placed object is ever exempt; a movable that is never placed stays fully screened.
+    assert not mask[1].any()
+
+
+def test_no_placements_means_no_masks():
+    """A pick-only skeleton exempts nothing, and must not reach for a pose timeline to size."""
+    host = _target_mask_host([("block", "pose1", "table")], [])  # block never activated
+    assert host._target_surface_masks({"action_to_pose_ts": {"pose1": 1}, "obj_to_pose": {}}) == {}
